@@ -36,6 +36,33 @@ that example data it also shows the *true* gas in place from the simulator
 beside what the material balance recovered — which is the quickest way to see
 what the two-phase z-factor is buying you.
 
+### Three ways to get data in
+
+- **Example field** — a simulated multi-well field, generated on the spot.
+- **Upload file** — CSV or Excel, with a column mapper for headers the alias
+  matcher doesn't recognise.
+- **Paste data** — an editable grid with the headers and their units already
+  in place. Select your rows in Excel or Google Sheets *without* the header
+  row, click the first cell and paste; rows are added as you need them.
+  Buttons load a worked sample, clear the grid, or download a blank CSV
+  template to fill in offline.
+
+The paste grid also has an expander that takes a whole block **including** its
+header row, for when pasting into a grid is more fiddly than pasting text.
+That path detects tabs, commas, semicolons, pipes and runs of whitespace, and
+a European decimal comma, and maps the headers through the same alias matcher
+the file loader uses — so a column called `Gas Rate (Mscf/d)` lands in `q_gas`
+rather than being silently dropped. It only accepts a block with a header row,
+at least two data rows and at least one genuinely numeric column, because
+otherwise prose parses happily into something table-shaped and fails
+confusingly later.
+
+Rows with an unreadable date or no positive gas rate are dropped, and the app
+says how many and why rather than quietly shrinking your dataset. Only `date`
+and `q_gas` are ever required; everything else unlocks extra analysis
+(`days_on` for an honest rate basis, `p_res` for the material balance, `p_wf`
+for FMB, `q_cond` for any condensate work at all).
+
 ---
 
 ## Why this isn't just Arps
@@ -115,8 +142,12 @@ python gas_condensate_dca.py --input field_history.csv \
 ## Input data
 
 Column names are matched case- and punctuation-insensitively against a list of
-aliases, so `Gas Rate (Mscf/d)`, `gas_mscfd` and `qg` all map to `q_gas`.
-Pass `column_map={"q_gas": "MY_WEIRD_COLUMN"}` for anything unusual.
+aliases, with any parenthesised or bracketed unit annotation stripped first —
+so `Gas Rate (Mscf/d)`, `GasRate`, `gas_rate`, `gas_mscfd` and `qg` all map to
+`q_gas`. Units in a header are **dropped, not honoured**: this module fixes
+units by contract, so a column actually reported in MMscf/d needs converting,
+not renaming. Pass `column_map={"q_gas": "MY_WEIRD_COLUMN"}` for anything the
+matcher misses, or use the app's **Column mapping** panel.
 
 | Column    | Units    | Required | Notes |
 |-----------|----------|----------|-------|

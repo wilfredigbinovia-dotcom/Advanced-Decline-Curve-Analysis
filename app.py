@@ -172,6 +172,109 @@ DEFAULT_CVD = pd.DataFrame({
 })
 
 
+PASTE_ROWS = 14
+PASTE_COLUMNS = ["date", "well", "days_on", "q_gas", "q_cond", "q_water",
+                 "p_wf", "p_res"]
+
+
+def blank_paste_frame(n: int = PASTE_ROWS) -> pd.DataFrame:
+    """An empty grid with the canonical headers, ready to paste into."""
+    return pd.DataFrame({
+        "date": pd.Series([""] * n, dtype="object"),
+        "well": pd.Series([""] * n, dtype="object"),
+        **{c: pd.Series([np.nan] * n, dtype="float64")
+           for c in PASTE_COLUMNS[2:]},
+    })
+
+
+def paste_column_config() -> dict:
+    """Headers carry their units, so a pasted column cannot be misread."""
+    num = st.column_config.NumberColumn
+    return {
+        "date": st.column_config.TextColumn(
+            "date", help="Any parseable date: 2021-03-01, 01/03/2021, Mar-2021",
+            width="small"),
+        "well": st.column_config.TextColumn(
+            "well", help="Leave blank to treat the whole table as one entity",
+            width="small"),
+        "days_on": num("days_on", help="Producing days in the period",
+                       format="%.1f"),
+        "q_gas": num("q_gas (Mscf/d)", help="Separator gas rate — required",
+                     format="%.1f"),
+        "q_cond": num("q_cond (STB/d)", help="Condensate rate", format="%.2f"),
+        "q_water": num("q_water (STB/d)", format="%.1f"),
+        "p_wf": num("p_wf (psia)", help="Flowing bottomhole pressure",
+                    format="%.0f"),
+        "p_res": num("p_res (psia)", help="Average reservoir pressure",
+                     format="%.0f"),
+    }
+
+
+def align_to_paste_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Fit an arbitrary table onto the grid's columns, keeping the dtypes.
+
+    Column names go through the same alias matcher the file loader uses, so a
+    block headed `Gas Rate (Mscf/d)` lands in `q_gas` rather than being lost.
+    """
+    d = dca.map_columns(df).copy()
+    out = pd.DataFrame(index=range(len(d)))
+    for c in PASTE_COLUMNS:
+        if c in ("date", "well"):
+            out[c] = (d[c].astype(str) if c in d.columns
+                      else pd.Series([""] * len(d), dtype="object"))
+            if c == "date" and c in d.columns:
+                parsed = pd.to_datetime(d[c], errors="coerce", format="mixed")
+                out[c] = parsed.dt.strftime("%Y-%m-%d").fillna(
+                    d[c].astype(str))
+        else:
+            # Always float: an int column cannot hold the blanks the editor
+            # writes back for empty cells.
+            out[c] = (pd.to_numeric(d[c], errors="coerce").astype("float64")
+                      if c in d.columns
+                      else pd.Series([np.nan] * len(d), dtype="float64"))
+    return out.reset_index(drop=True)
+
+
+def parse_paste_grid(edited: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Turn the edited grid into a production table, reporting what was lost."""
+    messages: list[str] = []
+    d = edited.copy()
+    for c in PASTE_COLUMNS:
+        if c not in d.columns:
+            d[c] = np.nan
+    d["date"] = d["date"].astype(str).str.strip().replace(
+        {"": np.nan, "nan": np.nan, "None": np.nan, "NaT": np.nan})
+    d["well"] = d["well"].astype(str).str.strip().replace(
+        {"": np.nan, "nan": np.nan, "None": np.nan})
+    for c in PASTE_COLUMNS[2:]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    d = d.dropna(subset=["date", "q_gas"], how="all")
+    n_rows = len(d)
+    if n_rows == 0:
+        return pd.DataFrame(), messages
+
+    parsed = pd.to_datetime(d["date"], errors="coerce", format="mixed")
+    bad_date = parsed.isna()
+    if bad_date.any():
+        messages.append(f"{int(bad_date.sum())} row(s) dropped: the date could "
+                        "not be read.")
+    d["date"] = parsed
+
+    bad_gas = d["q_gas"].isna() | (d["q_gas"] <= 0)
+    if bad_gas.any():
+        messages.append(f"{int(bad_gas.sum())} row(s) dropped: no positive gas "
+                        "rate.")
+
+    d = d[~bad_date & ~bad_gas]
+    # Drop columns that were left entirely blank so they do not clutter the
+    # mapping UI or masquerade as supplied-but-missing data.
+    for c in PASTE_COLUMNS[1:]:
+        if c in d.columns and d[c].isna().all():
+            d = d.drop(columns=[c])
+    return d.reset_index(drop=True), messages
+
+
 @st.cache_resource(show_spinner=False)
 def build_pvt(gas_gravity: float, temperature_F: float, condensate_api: float,
               condensate_mw: Optional[float], p_dew: Optional[float],
@@ -205,6 +308,82 @@ def read_upload(data: bytes, name: str) -> pd.DataFrame:
     if name.lower().endswith((".xlsx", ".xlsm", ".xls")):
         return pd.read_excel(buf)
     return pd.read_csv(buf)
+
+
+def _sniff_separator(text: str) -> Optional[str]:
+    """Pick the delimiter that appears the same number of times on every line.
+
+    Pasted data arrives from wherever the engineer copied it: Excel gives
+    tabs, an export gives commas, a European locale gives semicolons, a
+    terminal dump gives runs of spaces. Guessing from the header alone is
+    unreliable - a header can contain a comma inside a unit label - so the
+    delimiter has to be consistent down the block to be believed.
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()][:15]
+    if len(lines) < 2:
+        return None
+    best, best_count = None, 0
+    for sep in ("\t", ",", ";", "|"):
+        counts = {ln.count(sep) for ln in lines}
+        if len(counts) == 1 and counts != {0} and counts.pop() > best_count:
+            best, best_count = sep, max(ln.count(sep) for ln in lines)
+    return best
+
+
+@st.cache_data(show_spinner=False)
+def parse_pasted_text(text: str) -> pd.DataFrame:
+    """Turn a pasted text block into a dataframe, or explain why it could not.
+
+    Used to seed the paste grid from a text blob, and as the fallback for
+    people who would rather paste a whole block including its header row than
+    fill a grid.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n ")
+    if not text:
+        raise ValueError("Nothing was pasted.")
+    if len(text.splitlines()) < 3:
+        raise ValueError("Paste a header row and at least two data rows.")
+
+    sep = _sniff_separator(text)
+    attempts = []
+    if sep:
+        # A decimal comma only makes sense when the comma is not the delimiter.
+        attempts.append({"sep": sep, "decimal": "."})
+        if sep != ",":
+            attempts.append({"sep": sep, "decimal": ",", "thousands": None})
+    attempts.append({"sep": r"\s+", "decimal": "."})
+
+    last = None
+    for kw in attempts:
+        try:
+            df = pd.read_csv(io.StringIO(text), engine="python",
+                             skipinitialspace=True, **kw)
+        except Exception as exc:
+            last = exc
+            continue
+        if df.shape[1] < 2 or len(df) < 2:
+            continue
+        df.columns = [str(c).strip() for c in df.columns]
+        # A block of prose splits happily on whitespace into something shaped
+        # like a table, so require at least one genuinely numeric column
+        # before believing the parse.
+        numeric_cols = sum(
+            pd.to_numeric(df[c], errors="coerce").notna().mean() >= 0.6
+            for c in df.columns)
+        if numeric_cols == 0:
+            continue
+        probe = dca.map_columns(df)
+        # And if a gas column was recognised, it has to hold numbers.
+        if "q_gas" in probe.columns:
+            q = pd.to_numeric(probe["q_gas"], errors="coerce")
+            if q.notna().mean() < 0.5:
+                continue
+        return df
+
+    raise ValueError(
+        "Could not read that as a table. Expected a header row and one row "
+        "per period, separated by tabs, commas or semicolons."
+        + (f" (pandas said: {last})" if last else ""))
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -404,9 +583,58 @@ note("Everything is fitted on a <b>wellstream (gas-equivalent)</b> basis, then "
      "drift apart. Below the dew point the material balance uses a "
      "<b>two-phase z-factor</b>.")
 
+# A short, physically consistent history (plateau then decline, pressure
+# surveys every six months) so the sample actually analyses rather than
+# failing on too few points. Material balance recovers its true 46,000
+# MMscf to within 1%.
+SAMPLE_PASTE = """date	well	days_on	q_gas	q_cond	p_wf	p_res
+2021-01-01	A-1	31	27585	2301	1408	6400
+2021-02-01	A-1	9	28731	2349	1405	
+2021-03-01	A-1	28	29297	2441	1427	
+2021-04-01	A-1	19	26744	2092	1356	
+2021-05-01	A-1	30	29578	2468	1394	
+2021-06-01	A-1	31	28736	2321	1395	
+2021-07-01	A-1	30	29768	2252	1358	5212
+2021-08-01	A-1	31	28767	2322	1431	
+2021-09-01	A-1	31	30440	2321	1406	
+2021-10-01	A-1	30	26957	1884	1388	
+2021-11-01	A-1	25	31807	2105	1389	
+2021-12-01	A-1	30	30836	1893	1406	
+2022-01-01	A-1	31	27584	1822	1348	4178
+2022-02-01	A-1	31	29883	1786	1419	
+2022-03-01	A-1	28	29659	1549	1409	
+2022-04-01	A-1	31	25972	1404	1387	
+2022-05-01	A-1	30	29270	1484	1361	
+2022-06-01	A-1	31	24887	1370	1467	
+2022-07-01	A-1	11	34937	1868	1392	3304
+2022-08-01	A-1	31	21924	1075	1411	
+2022-09-01	A-1	31	20526	929	1393	
+2022-10-01	A-1	30	19665	936	1388	
+2022-11-01	A-1	31	18451	767	1365	
+2022-12-01	A-1	11	26226	1193	1391	
+2023-01-01	A-1	31	16228	709	1438	2816
+2023-02-01	A-1	31	14270	627	1380	
+2023-03-01	A-1	28	13534	583	1462	
+2023-04-01	A-1	31	13532	546	1451	
+2023-05-01	A-1	30	13605	620	1396	
+2023-06-01	A-1	31	12632	519	1440	
+2023-07-01	A-1	30	11031	463	1385	2439
+2023-08-01	A-1	31	10363	468	1405	
+2023-09-01	A-1	31	9800	406	1401	
+2023-10-01	A-1	30	9880	394	1403	
+2023-11-01	A-1	31	9828	388	1414	
+2023-12-01	A-1	30	8802	371	1431	
+2024-01-01	A-1	31	8705	367	1443	2192
+2024-02-01	A-1	31	8081	332	1383	
+2024-03-01	A-1	29	8241	340	1355	
+2024-04-01	A-1	31	6377	240	1408	
+2024-05-01	A-1	30	6071	217	1442	
+2024-06-01	A-1	31	6515	239	1359	"""
+
 src_col, a_col, b_col = st.columns([1.1, 1, 2.2])
 with src_col:
-    source = st.radio("Data source", ["Example field", "Upload file"],
+    source = st.radio("Data source",
+                      ["Example field", "Upload file", "Paste data"],
                       horizontal=False, label_visibility="collapsed")
 
 upload = None
@@ -416,9 +644,62 @@ if source == "Upload file":
         upload = st.file_uploader("Production history (CSV or Excel)",
                                   type=["csv", "xlsx", "xlsm", "xls"],
                                   label_visibility="collapsed")
+elif source == "Paste data":
+    with b_col:
+        st.caption("A table with the headers already in place. Paste a block "
+                   "straight from Excel or Google Sheets, or type into it.")
 else:
     n_wells = a_col.slider("Wells", 1, 8, 4)
     seed = b_col.number_input("Seed", 0, 9999, 5, 1)
+
+paste_grid = None
+if source == "Paste data":
+    st.caption("Select your data in the spreadsheet **without** its header "
+               "row, click the first cell below and paste. Rows are added as "
+               "you need them. Only `date` and `q_gas` are required — leave "
+               "any other column blank.")
+
+    if st.session_state.pop("_load_sample", False):
+        st.session_state.pop("paste_editor", None)
+        st.session_state["paste_frame"] = align_to_paste_columns(
+            parse_pasted_text(SAMPLE_PASTE))
+    if st.session_state.pop("_clear_grid", False):
+        st.session_state.pop("paste_editor", None)
+        st.session_state["paste_frame"] = blank_paste_frame()
+
+    paste_grid = st.data_editor(
+        st.session_state.get("paste_frame", blank_paste_frame()),
+        column_config=paste_column_config(), column_order=PASTE_COLUMNS,
+        num_rows="dynamic", hide_index=True, key="paste_editor",
+        height=440)
+
+    b1, b2, b3 = st.columns([1, 1, 3])
+    b1.button("Load a sample", on_click=lambda: st.session_state.update(
+        _load_sample=True),
+        help="Fills the grid with a small worked example.")
+    b2.button("Clear table", on_click=lambda: st.session_state.update(
+        _clear_grid=True))
+    b3.download_button(
+        "Blank CSV template",
+        blank_paste_frame(0).to_csv(index=False).encode(),
+        "production_template.csv", "text/csv",
+        help="Fill this in a spreadsheet, then paste the rows back here.")
+
+    with st.expander("Rather paste a whole block, header row and all?"):
+        blob = st.text_area(
+            "Paste the table as text", height=150,
+            label_visibility="collapsed",
+            placeholder=("date\twell\tdays_on\tq_gas\tq_cond\tp_wf\tp_res\n"
+                         "2019-01-01\tA-1\t31\t28450\t2210\t1420\t6180\n"
+                         "...  header row first, one row per period"))
+        if st.button("Load into the table", disabled=not blob.strip()):
+            try:
+                st.session_state["paste_frame"] = align_to_paste_columns(
+                    parse_pasted_text(blob))
+                st.session_state.pop("paste_editor", None)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 
 raw_df: Optional[pd.DataFrame] = None
 if source == "Example field":
@@ -438,17 +719,31 @@ if source == "Example field":
                "condensate-bank mobility penalty below the dew point and a "
                "facility plateau, with noise and downtime applied inside the "
                "loop so rates, cumulatives and pressures stay consistent.")
-elif upload is not None:
+elif source == "Upload file" and upload is not None:
     st.session_state["truth_ogip"] = {}
     try:
         raw_df = read_upload(upload.getvalue(), upload.name)
     except Exception as exc:
         st.error(f"Could not read that file: {exc}")
         st.stop()
+elif source == "Paste data" and paste_grid is not None:
+    st.session_state["truth_ogip"] = {}
+    parsed_df, paste_msgs = parse_paste_grid(paste_grid)
+    for msg in paste_msgs:
+        st.caption(f"· {msg}")
+    if len(parsed_df) < 4:
+        st.info("Enter or paste at least 4 rows with a date and a positive "
+                "gas rate to run the analysis.")
+        st.stop()
+    n_w = parsed_df["well"].nunique() if "well" in parsed_df.columns else 1
+    st.success(
+        f"{len(parsed_df):,} usable row(s) · {n_w} well(s) · "
+        f"{parsed_df['date'].min():%b %Y} to {parsed_df['date'].max():%b %Y}")
+    raw_df = parsed_df
 
 if raw_df is None or raw_df.empty:
-    st.info("Upload a production history, or switch to the example field to "
-            "see the whole workflow.")
+    st.info("Upload a production history, paste one in, or switch to the "
+            "example field to see the whole workflow.")
     with st.expander("Expected columns"):
         st.markdown("""
 | Column | Units | Required | Notes |

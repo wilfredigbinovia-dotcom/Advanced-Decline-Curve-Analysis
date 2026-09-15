@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import os
 import sys
 import warnings
@@ -595,22 +596,49 @@ class PVT:
 
 # Canonical column names the rest of the module expects.
 CANONICAL_COLUMNS = {
-    "date": ["date", "prod_date", "production_date", "month", "day", "time_stamp"],
-    "well": ["well", "well_name", "uwi", "api", "wellid", "well_id"],
-    "days_on": ["days_on", "days_online", "uptime_days", "producing_days", "onstream_days"],
-    "q_gas": ["q_gas", "gas_rate", "gas", "gas_mscfd", "qg", "gas_mscf_d"],
-    "q_cond": ["q_cond", "cond_rate", "condensate", "oil_rate", "qo", "cond_stbd", "oil"],
-    "q_water": ["q_water", "water_rate", "water", "qw", "water_stbd"],
-    "p_wf": ["p_wf", "bhp", "fbhp", "bottomhole_pressure", "pwf"],
-    "p_wh": ["p_wh", "thp", "fthp", "wellhead_pressure", "pwh", "tubing_pressure"],
-    "p_res": ["p_res", "reservoir_pressure", "p_avg", "static_pressure", "shut_in_pressure"],
-    "gas_cum": ["gas_cum", "cum_gas", "gp"],
-    "cond_cum": ["cond_cum", "cum_cond", "np", "cum_oil"],
+    "date": ["date", "prod_date", "production_date", "month", "day",
+             "time_stamp", "period", "report_date"],
+    "well": ["well", "well_name", "uwi", "api", "wellid", "well_id",
+             "completion", "string"],
+    "days_on": ["days_on", "days_online", "uptime_days", "producing_days",
+                "onstream_days", "prod_days", "uptime", "on_stream_days",
+                "days", "days_on_stream", "op_days", "days_produced"],
+    "q_gas": ["q_gas", "gas_rate", "gas", "gas_mscfd", "qg", "gas_mscf_d",
+              "gas_volume_rate", "sep_gas", "separator_gas", "gas_production",
+              "q_g", "gas_prod", "dry_gas"],
+    "q_cond": ["q_cond", "cond_rate", "condensate", "oil_rate", "qo",
+               "cond_stbd", "oil", "condensate_rate", "liquid_rate",
+               "condensate_production", "cond", "qc", "liquid", "cond_prod",
+               "condensate_volume"],
+    "q_water": ["q_water", "water_rate", "water", "qw", "water_stbd",
+                "water_production", "wtr", "brine"],
+    "p_wf": ["p_wf", "bhp", "fbhp", "bottomhole_pressure", "pwf",
+             "flowing_bhp", "bottom_hole_pressure", "bhfp",
+             "flowing_pressure"],
+    "p_wh": ["p_wh", "thp", "fthp", "wellhead_pressure", "pwh",
+             "tubing_pressure", "tubing_head_pressure"],
+    "p_res": ["p_res", "reservoir_pressure", "p_avg", "static_pressure",
+              "shut_in_pressure", "average_pressure", "sibhp", "pres",
+              "p_bar", "static_bhp", "avg_reservoir_pressure"],
+    "gas_cum": ["gas_cum", "cum_gas", "gp", "cumulative_gas"],
+    "cond_cum": ["cond_cum", "cum_cond", "np", "cum_oil", "cumulative_condensate"],
 }
 
 
 def _normalise(name: str) -> str:
-    return "".join(ch for ch in str(name).lower().strip() if ch.isalnum() or ch == "_")
+    """Reduce a column header to a comparable key.
+
+    Real headers carry their units - "Gas Rate (Mscf/d)", "Condensate [STB/d]"
+    - and separate words however the author felt like. Parenthesised or
+    bracketed annotations are dropped, then everything that is not a letter or
+    digit goes, so "Gas Rate (Mscf/d)", "gas_rate" and "GasRate" all collapse
+    to the same key. Units are dropped rather than matched because this module
+    fixes the units by contract; a header claiming different ones needs
+    converting, not renaming.
+    """
+    s = str(name).lower().strip()
+    s = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", s)
+    return re.sub(r"[^a-z0-9]+", "", s)
 
 
 def map_columns(df: pd.DataFrame,
