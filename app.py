@@ -11,7 +11,7 @@ requirements.txt sits beside it at the repository root.
 
 Layout
 ------
-  sidebar : fluid definition (PVT), CVD table, processing split, run settings
+  sidebar : fluid definition (PVT), CVD table, run settings
   tabs    : Data & QC -> Decline fit -> Yield -> Material balance ->
             Forecast -> Uncertainty -> Field -> Export
 
@@ -148,6 +148,39 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+NGL_COLUMNS = ["q_ngl_stbd", "cum_ngl_mstb"]
+SEP_RENAMES = {"q_sales_gas_mscfd": "q_sep_gas_mscfd",
+               "cum_sales_gas_mmscf": "cum_sep_gas_mmscf"}
+
+
+def tidy_forecast(table: pd.DataFrame) -> pd.DataFrame:
+    """Drop the plant-NGL columns and rename sales gas to separator gas.
+
+    With no surface processing declared, sales gas is identically the separator
+    gas and NGL is identically zero. Carrying both through the tables invites
+    someone to quote a sales-gas number that has had no processing applied.
+    """
+    t = table.drop(columns=[c for c in NGL_COLUMNS if c in table.columns])
+    # q_sep_gas_mscfd already exists from the engine and equals sales gas here,
+    # so drop the duplicate rather than collide on the rename.
+    dupes = [old for old, new in SEP_RENAMES.items()
+             if old in t.columns and new in t.columns]
+    t = t.drop(columns=dupes)
+    return t.rename(columns={k: v for k, v in SEP_RENAMES.items()
+                             if k in t.columns})
+
+
+def tidy_summary_text(text: str) -> str:
+    """Strip the NGL lines from a Forecast.summary() block and relabel gas.
+
+    The replacement eats four trailing spaces so the colons stay aligned:
+    "sales gas" is 9 characters, "separator gas" is 13.
+    """
+    keep = [ln for ln in text.splitlines() if "NGL" not in ln]
+    return "\n".join(ln.replace("sales gas    ", "separator gas")
+                     for ln in keep)
 
 
 def note(text: str) -> None:
@@ -388,14 +421,15 @@ def parse_pasted_text(text: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
-                 settings: tuple, products: tuple, well_col: Optional[str]):
+                 settings: tuple, well_col: Optional[str]):
     """Analyse every well. Keyed on the dataframe, PVT signature and settings."""
     (q_econ, model, terminal, t_max, run_mc, n_mc, use_mb, use_fmb, cap,
      rate_basis, min_uptime, outlier_sigma, fit_from_bdf, window) = settings
-    split = dca.ProductSplit(inert_fraction=products[0],
-                             fuel_flare_fraction=products[1],
-                             ngl_yield_gal_per_mscf=products[2],
-                             ngl_shrinkage_fraction=products[3])
+    # No surface processing is applied, so "sales gas" is the separator gas and
+    # plant NGL is zero. Both are reported on the separator-gas basis below.
+    split = dca.ProductSplit(inert_fraction=0.0, fuel_flare_fraction=0.0,
+                             ngl_yield_gal_per_mscf=0.0,
+                             ngl_shrinkage_fraction=0.0)
 
     raw = dca.map_columns(df)
     groups = ({str(k): v for k, v in raw.groupby(well_col)}
@@ -438,9 +472,8 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
             "Gp_to_date_mmscf": float(r.data.Gp_ws[-1]),
             "Np_cond_to_date_mstb": float(r.data.Np_cond[-1]),
             "EUR_wellstream_mmscf": r.forecast.eur_wellstream_mmscf,
-            "EUR_sales_gas_mmscf": r.forecast.eur_sales_gas_mmscf,
+            "EUR_sep_gas_mmscf": r.forecast.eur_sales_gas_mmscf,
             "EUR_condensate_mstb": r.forecast.eur_condensate_mstb,
-            "EUR_ngl_mstb": r.forecast.eur_ngl_mstb,
             "remaining_gas_mmscf": r.forecast.remaining_wellstream_mmscf,
             "life_yr": r.forecast.economic_life_years,
             "OGIP_matbal_mmscf": (r.matbal.ogip_mmscf if r.matbal else np.nan),
@@ -488,14 +521,6 @@ with st.sidebar:
              "properties should use the wet-gas gravity, not the separator "
              "gas gravity.")
 
-    with st.expander("Inerts"):
-        y_n2 = st.number_input("N2 mole fraction", 0.0, 0.5, 0.012, 0.001,
-                               format="%.3f")
-        y_co2 = st.number_input("CO2 mole fraction", 0.0, 0.5, 0.031, 0.001,
-                                format="%.3f")
-        y_h2s = st.number_input("H2S mole fraction", 0.0, 0.3, 0.0, 0.001,
-                                format="%.3f")
-
     with st.expander("CVD table (two-phase z)"):
         note("From the lab CVD report. Without it the Rayes correlation is "
              "used, which is a regression rather than your fluid.")
@@ -503,18 +528,6 @@ with st.sidebar:
         cvd_df = st.data_editor(DEFAULT_CVD, num_rows="dynamic",
                                 key="cvd_editor",
                                 disabled=not use_cvd)
-
-    st.divider()
-    st.markdown("### Surface processing")
-    c1, c2 = st.columns(2)
-    inert_frac = c1.number_input("Inerts removed", 0.0, 0.5, 0.043, 0.001,
-                                 format="%.3f")
-    fuel_frac = c2.number_input("Fuel & flare", 0.0, 0.3, 0.020, 0.001,
-                                format="%.3f")
-    c1, c2 = st.columns(2)
-    ngl_yield = c1.number_input("NGL yield (gal/Mscf)", 0.0, 10.0, 1.8, 0.1)
-    ngl_shrink = c2.number_input("NGL shrinkage", 0.0, 0.3, 0.03, 0.005,
-                                 format="%.3f")
 
     st.divider()
     st.markdown("### Analysis settings")
@@ -555,6 +568,11 @@ with st.sidebar:
 # PVT object
 # ==============================================================================
 
+# Inert content is not exposed in the UI; the pseudo-criticals are built on the
+# hydrocarbon gravity alone. For a sour or nitrogen-rich gas, pass the mole
+# fractions to gas_condensate_dca.PVT directly instead of using this app.
+Y_N2 = Y_CO2 = Y_H2S = 0.0
+
 cvd_key = None
 if use_cvd and cvd_df is not None and len(cvd_df.dropna()) >= 3:
     clean = cvd_df.dropna(subset=["pressure_psia", "cum_produced_molfrac"])
@@ -564,14 +582,14 @@ if use_cvd and cvd_df is not None and len(cvd_df.dropna()) >= 3:
 try:
     pvt = build_pvt(gas_gravity, temperature_F, condensate_api,
                     (mw_override or None), (p_dew or None), (p_init or None),
-                    y_n2, y_co2, y_h2s, (initial_cgr or None),
+                    Y_N2, Y_CO2, Y_H2S, (initial_cgr or None),
                     use_wellstream, cvd_key)
 except Exception as exc:
     st.error(f"The fluid definition is not valid: {exc}")
     st.stop()
 
 pvt_sig = (gas_gravity, temperature_F, condensate_api, mw_override, p_dew,
-           p_init, y_n2, y_co2, y_h2s, initial_cgr, use_wellstream, cvd_key)
+           p_init, Y_N2, Y_CO2, Y_H2S, initial_cgr, use_wellstream, cvd_key)
 
 # ==============================================================================
 # Header and data intake
@@ -822,12 +840,10 @@ if not auto_window:
 settings = (q_econ, model_choice, terminal, float(t_max), run_mc, int(n_mc),
             use_mb, use_fmb, cap_ogip, rate_basis, min_uptime, outlier_sigma,
             auto_window, window)
-products = (inert_frac, fuel_frac, ngl_yield, ngl_shrink)
-
 with st.spinner("Fitting declines, yield models and material balance..."):
     try:
         results, summary, profile, errors = run_analysis(
-            work_df, pvt, pvt_sig, settings, products, well_col)
+            work_df, pvt, pvt_sig, settings, well_col)
     except Exception:
         st.error("The analysis failed.")
         st.code(traceback.format_exc())
@@ -857,7 +873,10 @@ m = st.columns(5)
 m[0].metric("EUR wellstream gas",
             f"{res.forecast.eur_wellstream_mmscf:,.0f} MMscf",
             f"{res.forecast.remaining_wellstream_mmscf:,.0f} remaining")
-m[1].metric("EUR sales gas", f"{res.forecast.eur_sales_gas_mmscf:,.0f} MMscf")
+m[1].metric("EUR separator gas",
+            f"{res.forecast.eur_sales_gas_mmscf:,.0f} MMscf",
+            help="Wellstream gas less the condensate gas equivalent. No "
+                 "surface processing is applied.")
 m[2].metric("EUR condensate",
             f"{res.forecast.eur_condensate_mstb:,.0f} Mstb",
             f"{res.forecast.remaining_condensate_mstb:,.0f} remaining")
@@ -995,7 +1014,7 @@ with tabs[3]:
 
 # ------------------------------------------------------------------- Forecast
 with tabs[4]:
-    st.code(res.forecast.summary(), language="text")
+    st.code(tidy_summary_text(res.forecast.summary()), language="text")
     c1, c2 = st.columns(2)
     with c1:
         show_fig(ch.chart_rate_time(res, THEME, show_separator=False),
@@ -1003,7 +1022,7 @@ with tabs[4]:
     with c2:
         show_fig(ch.chart_condensate(res, THEME), key="fx_cond")
     with st.expander("Forecast table"):
-        show_df(res.forecast.table, height=400)
+        show_df(tidy_forecast(res.forecast.table), height=400)
 
 # ---------------------------------------------------------------- Uncertainty
 with tabs[5]:
@@ -1043,14 +1062,14 @@ with tabs[5]:
 
 # ---------------------------------------------------------------------- Field
 with tabs[6]:
-    tot = summary[["EUR_wellstream_mmscf", "EUR_sales_gas_mmscf",
+    tot = summary[["EUR_wellstream_mmscf", "EUR_sep_gas_mmscf",
                    "EUR_condensate_mstb"]].sum()
     k = st.columns(4)
     k[0].metric("Wells analysed", len(summary))
     k[1].metric("Field EUR wellstream gas",
                 f"{tot['EUR_wellstream_mmscf']:,.0f} MMscf")
-    k[2].metric("Field EUR sales gas",
-                f"{tot['EUR_sales_gas_mmscf']:,.0f} MMscf")
+    k[2].metric("Field EUR separator gas",
+                f"{tot['EUR_sep_gas_mmscf']:,.0f} MMscf")
     k[3].metric("Field EUR condensate",
                 f"{tot['EUR_condensate_mstb']:,.0f} Mstb")
     note("The field profile is the sum of well forecasts on a common time "
@@ -1090,7 +1109,7 @@ with tabs[7]:
                        profile.to_csv(index=False).encode(),
                        "field_profile.csv", "text/csv")
     c3.download_button(f"{sel} forecast (CSV)",
-                       res.forecast.table.to_csv(index=False).encode(),
+                       tidy_forecast(res.forecast.table).to_csv(index=False).encode(),
                        f"{sel}_forecast.csv", "text/csv")
 
     buf = io.BytesIO()
@@ -1102,8 +1121,8 @@ with tabs[7]:
                 tag = str(name)[:24]
                 r.data.df.to_excel(xl, sheet_name=f"{tag}_hist"[:31],
                                    index=False)
-                r.forecast.table.to_excel(xl, sheet_name=f"{tag}_fcst"[:31],
-                                          index=False)
+                tidy_forecast(r.forecast.table).to_excel(
+                    xl, sheet_name=f"{tag}_fcst"[:31], index=False)
         st.download_button("Full workbook (XLSX)", buf.getvalue(),
                            "gas_condensate_dca.xlsx",
                            "application/vnd.openxmlformats-officedocument."
