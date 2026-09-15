@@ -1,15 +1,40 @@
 # Gas Condensate Decline Curve Analysis
 
 `gas_condensate_dca.py` — a single-file Python engine for defensible DCA on
-retrograde gas condensate wells and fields.
-
-Requires `numpy`, `scipy`, `pandas`, `matplotlib`, and `openpyxl` (Excel export only).
+retrograde gas condensate wells and fields, plus a Streamlit front end.
 
 ```bash
-pip install numpy scipy pandas matplotlib openpyxl
+pip install -r requirements.txt
 python gas_condensate_dca.py --selftest   # 20 internal consistency checks
 python gas_condensate_dca.py --demo       # worked example on synthetic data
+streamlit run app.py                      # the web app
 ```
+
+## Deploying the Streamlit app
+
+Everything the app needs is in `streamlit_app/`. Copy its contents to the root
+of your repository:
+
+```
+your-repo/
+├── app.py                  # Streamlit front end
+├── dca_charts.py           # Plotly charts
+├── gas_condensate_dca.py   # the analysis engine
+├── requirements.txt        # MUST be at the repo root
+└── .streamlit/
+    └── config.toml         # theme
+```
+
+Point Streamlit Cloud at `app.py`. If a deploy fails with `ModuleNotFoundError`,
+it is almost always because `requirements.txt` is missing, is in a subfolder, or
+does not list the package that failed — Streamlit Cloud installs nothing beyond
+its base image on its own. After pushing a change to it, use **Manage app →
+Reboot app**; a cached environment sometimes survives a plain commit.
+
+The app opens on a synthetic field, so it works before you upload anything. On
+that example data it also shows the *true* gas in place from the simulator
+beside what the material balance recovered — which is the quickest way to see
+what the two-phase z-factor is buying you.
 
 ---
 
