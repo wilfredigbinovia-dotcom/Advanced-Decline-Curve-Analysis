@@ -26,6 +26,8 @@ from __future__ import annotations
 import contextlib
 import io
 import math
+import os
+import sys
 import traceback
 from typing import Dict, Optional
 
@@ -33,8 +35,24 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import gas_condensate_dca as dca
-import dca_charts as ch
+# -- local module import ------------------------------------------------------
+# Streamlit Cloud redacts import errors, so a missing sibling file shows up as
+# an unexplained ModuleNotFoundError. Look in the obvious places first, then
+# fail with a message that actually says what is missing and what is present.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (_HERE, os.path.join(_HERE, "streamlit_app"),
+                   os.path.join(_HERE, "src"),
+                   os.path.dirname(_HERE)):
+    if os.path.isdir(_candidate) and _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+_import_error: Optional[BaseException] = None
+try:
+    import gas_condensate_dca as dca
+    import dca_charts as ch
+except BaseException as _exc:       # noqa: BLE001 - reported to the user below
+    _import_error = _exc
+    dca = ch = None                 # type: ignore[assignment]
 
 # ==============================================================================
 # Page setup
@@ -46,6 +64,34 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+if _import_error is not None:
+    missing = getattr(_import_error, "name", None) or "a required module"
+    st.error(f"Could not import **{missing}**.")
+    if missing in ("gas_condensate_dca", "dca_charts"):
+        st.markdown(
+            f"`{missing}.py` has to sit in the same folder as `app.py`. "
+            "The files below are what the app can actually see."
+        )
+    else:
+        st.markdown(
+            f"`{missing}` is a third-party package, so it belongs in "
+            "`requirements.txt` at the **repository root**. Streamlit Cloud "
+            "installs nothing beyond its base image on its own. After adding "
+            "it, use **Manage app -> Reboot app**."
+        )
+    try:
+        listing = "\n".join(sorted(
+            f"{'DIR ' if os.path.isdir(os.path.join(_HERE, n)) else '    '}{n}"
+            for n in os.listdir(_HERE)))
+    except Exception:
+        listing = "(could not list the application directory)"
+    st.code(f"{_HERE}\n\n{listing}", language="text")
+    with st.expander("Full traceback"):
+        st.code("".join(traceback.format_exception(
+            type(_import_error), _import_error,
+            _import_error.__traceback__)), language="text")
+    st.stop()
 
 
 def current_theme() -> str:
