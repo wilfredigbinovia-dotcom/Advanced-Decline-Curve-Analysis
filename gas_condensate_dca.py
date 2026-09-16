@@ -3250,6 +3250,8 @@ class Forecast:
     remaining_sales_gas_mmscf: float
     remaining_condensate_mstb: float
     remaining_ngl_mstb: float
+    ogip_cap_mmscf: Optional[float] = None
+    cap_binding: bool = False           # did the cap actually truncate anything
 
     def summary(self) -> str:
         return "\n".join([
@@ -3265,6 +3267,12 @@ class Forecast:
             f"    sales gas        : {self.remaining_sales_gas_mmscf:,.0f} MMscf",
             f"    condensate       : {self.remaining_condensate_mstb:,.0f} Mstb",
             f"    plant NGL        : {self.remaining_ngl_mstb:,.0f} Mstb",
+            (f"  OGIP cap           : {self.ogip_cap_mmscf:,.0f} MMscf"
+             + (" -- BINDING, the forecast was truncated here"
+                if self.cap_binding else
+                " -- not reached, the cap had no effect")
+             if self.ogip_cap_mmscf is not None else
+             "  OGIP cap           : none"),
         ])
 
 
@@ -3311,6 +3319,11 @@ def forecast_products(fit: FitResult,
     cum_at_start = float(model.cum(np.array([t_start_days]))[0])
     gp = gp_to_date_mmscf + (cum_model - cum_at_start)
 
+    # A cap only does something when the decline would otherwise run past it.
+    # Below that it is inert, and saying so is the difference between a user
+    # believing the setting is broken and knowing the forecast simply never
+    # reached the limit.
+    cap_binding = False
     if ogip_cap_mmscf is not None and np.isfinite(ogip_cap_mmscf):
         over = gp > ogip_cap_mmscf
         if np.any(over):
@@ -3319,6 +3332,7 @@ def forecast_products(fit: FitResult,
                 keep[:2] = True
             t, q_ws, gp = t[keep], q_ws[keep], gp[keep]
             t_ab = float(t[-1])
+            cap_binding = True
 
     cgr = yield_model(gp)                          # STB/MMscf
     q_cond = q_ws / MSCF_PER_MMSCF * cgr           # STB/d
@@ -3366,6 +3380,10 @@ def forecast_products(fit: FitResult,
         remaining_sales_gas_mmscf=float(cum_sales[-1]),
         remaining_condensate_mstb=float(cum_cond[-1]),
         remaining_ngl_mstb=float(cum_ngl[-1]),
+        ogip_cap_mmscf=(float(ogip_cap_mmscf)
+                        if ogip_cap_mmscf is not None
+                        and np.isfinite(ogip_cap_mmscf) else None),
+        cap_binding=bool(cap_binding),
     )
 
 
@@ -4619,6 +4637,27 @@ def run_self_tests(verbose: bool = True) -> bool:
     check("switching the cap off leaves the forecast uncapped",
           not np.isfinite(select_ogip(sup_cap, mode="none").value),
           "mode='none' returns no cap")
+
+    # A cap is a limit, not a target: above the forecast it must do nothing at
+    # all, and the result has to say which of the two happened.
+    ym_cap = YieldModel(cgr_i=78.0, cgr_min=25.0, k=6.0e-5)
+    fr_cap = fit_decline(t, q, "modified_hyperbolic", t0=0.0,
+                         fixed={"Dmin": truth.Dmin})
+    f_free = forecast_products(fr_cap, ym_cap, pvt_cvd, 300.0)
+    f_tight = forecast_products(fr_cap, ym_cap, pvt_cvd, 300.0,
+                                ogip_cap_mmscf=0.6 * f_free.eur_wellstream_mmscf)
+    f_loose = forecast_products(fr_cap, ym_cap, pvt_cvd, 300.0,
+                                ogip_cap_mmscf=3.0 * f_free.eur_wellstream_mmscf)
+    check("a cap below the forecast truncates it and says so",
+          f_tight.cap_binding
+          and f_tight.eur_wellstream_mmscf < f_free.eur_wellstream_mmscf,
+          f"{f_tight.eur_wellstream_mmscf:,.0f} vs uncapped "
+          f"{f_free.eur_wellstream_mmscf:,.0f} MMscf")
+    check("a cap above the forecast changes nothing and says so",
+          (not f_loose.cap_binding)
+          and abs(f_loose.eur_wellstream_mmscf
+                  / f_free.eur_wellstream_mmscf - 1) < 1e-9,
+          f"{f_loose.eur_wellstream_mmscf:,.0f} MMscf, cap inert")
 
     # 9d2 -- day-first dates are recognised from the shape of the history
     df_dates = pd.Series([f"01/{m:02d}/{y}" for y in (2012, 2013)

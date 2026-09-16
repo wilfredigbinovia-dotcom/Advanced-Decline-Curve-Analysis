@@ -1318,9 +1318,14 @@ with tabs[3]:
                  "place is known, so you can see what the two-phase material "
                  "balance recovers and what the single-phase shortcut costs.")
         mb = res.matbal
-        k = st.columns(5)
+        k = st.columns(6)
         k[0].metric("OGIP (p/z line)", f"{mb.ogip_mmscf:,.0f} MMscf",
-                    f"R² {mb.r2:.3f}", delta_color="off")
+                    f"R² {mb.r2:.3f}", delta_color="off",
+                    help="The straight-line intercept, always. This tile is "
+                         "the p/z diagnostic and does not follow the cap "
+                         "selector — see **Forecast cap** at the end of the "
+                         "row for the number the forecast is actually held "
+                         "to.")
         k[1].metric("G ceiling (We ≥ 0)",
                     f"{mb.g_ceiling_mmscf:,.0f} MMscf"
                     if np.isfinite(mb.g_ceiling_mmscf) else "n/a",
@@ -1331,6 +1336,15 @@ with tabs[3]:
                     f"{mb.ho_rise:.2f}×" if np.isfinite(mb.ho_rise) else "n/a")
         k[3].metric("Drive", mb.drive.title())
         k[4].metric("Produced", f"{mb.gp_now:,.0f} MMscf")
+        _oc = res.ogip_choice
+        if _oc is not None and np.isfinite(_oc.value):
+            k[5].metric("Forecast cap", f"{_oc.value:,.0f} MMscf",
+                        _oc.source, delta_color="off",
+                        help="The gas in place the forecast is held to, "
+                             "chosen by the **Which gas in place** setting in "
+                             "the sidebar.")
+        else:
+            k[5].metric("Forecast cap", "none", delta_color="off")
 
         if np.isfinite(mb.p_initial):
             src = ("as entered in the sidebar" if mb.p_initial_known else
@@ -1375,9 +1389,23 @@ with tabs[3]:
                     (f"<b>{k} {v:,.0f}</b>" if k == oc.source
                      else f"{k} {v:,.0f}")
                     for k, v in (oc.candidates or {}).items())
+                fcv = res.forecast
+                if getattr(fcv, "cap_binding", False):
+                    bite = ("<b>The cap is binding:</b> the decline would "
+                            "otherwise have produced more than this, so the "
+                            "forecast was truncated when cumulative "
+                            "wellstream gas reached it.")
+                else:
+                    bite = (f"<b>The cap is not binding here.</b> The forecast "
+                            f"ends at "
+                            f"{fcv.eur_wellstream_mmscf:,.0f} MMscf, below the "
+                            "cap, so it never bites and changing this setting "
+                            "will not move the EUR. It is a limit, not a "
+                            "target.")
                 note(f"<b>Forecast cap: {oc.value:,.0f} MMscf</b> "
                      f"({oc.source}, ±{100 * oc.rel_sigma:.0f} % in the Monte "
-                     f"Carlo). {oc.reason}<br>Candidates — {bits} MMscf.")
+                     f"Carlo). {oc.reason}<br>{bite}<br>Candidates — "
+                     f"{bits} MMscf.")
             else:
                 note(f"<b>The forecast is not capped.</b> {oc.reason}")
 
