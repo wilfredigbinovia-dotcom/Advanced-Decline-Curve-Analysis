@@ -94,6 +94,21 @@ if _import_error is not None:
     st.stop()
 
 
+# ==============================================================================
+# Deferred widget writes
+# ==============================================================================
+# Streamlit refuses to let session state be written under a widget's key once
+# that widget has been instantiated in the current run. The estimated initial
+# pressure is decided far down the page, long after the sidebar has rendered,
+# so it is parked under a staging key and moved onto the widget here, at the
+# top of the following run, before any widget exists.
+
+_STAGED = {"_stage_p_init": "w_p_init", "_stage_mb_pi": "w_mb_pi"}
+for _stage, _target in _STAGED.items():
+    if _stage in st.session_state:
+        st.session_state[_target] = st.session_state.pop(_stage)
+
+
 def current_theme() -> str:
     """Which theme the viewer is actually in, across Streamlit versions."""
     try:
@@ -256,7 +271,7 @@ def align_to_paste_columns(df: pd.DataFrame) -> pd.DataFrame:
             out[c] = (d[c].astype(str) if c in d.columns
                       else pd.Series([""] * len(d), dtype="object"))
             if c == "date" and c in d.columns:
-                parsed = pd.to_datetime(d[c], errors="coerce", format="mixed")
+                parsed = dca.parse_dates(d[c])
                 out[c] = parsed.dt.strftime("%Y-%m-%d").fillna(
                     d[c].astype(str))
         else:
@@ -282,19 +297,37 @@ def parse_paste_grid(edited: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     for c in PASTE_COLUMNS[2:]:
         d[c] = pd.to_numeric(d[c], errors="coerce")
 
-    d = d.dropna(subset=["date", "q_gas"], how="all")
+    d = d.dropna(subset=["date", "q_gas", "p_res"], how="all")
     n_rows = len(d)
     if n_rows == 0:
         return pd.DataFrame(), messages
 
-    parsed = pd.to_datetime(d["date"], errors="coerce", format="mixed")
+    parsed = dca.parse_dates(d["date"])
     bad_date = parsed.isna()
     if bad_date.any():
         messages.append(f"{int(bad_date.sum())} row(s) dropped: the date could "
                         "not be read.")
     d["date"] = parsed
 
-    bad_gas = d["q_gas"].isna() | (d["q_gas"] <= 0)
+    # A row with a pressure and no rate is a static survey, and gauges are run
+    # precisely on the months a well is shut in. Dropping it for want of a rate
+    # throws away the only measurement of the reservoir in that row — which is
+    # how the material balance ends up reporting no pressure data on a well
+    # that plainly has it.
+    survey_only = d["p_res"].notna() & (d["p_res"] > 0) & (
+        d["q_gas"].isna() | (d["q_gas"] <= 0))
+    d.loc[survey_only, "q_gas"] = 0.0
+    if survey_only.any():
+        messages.append(f"{int(survey_only.sum())} row(s) kept as pressure "
+                        "surveys: a reservoir pressure with no rate.")
+        # A blank well on a survey row would be dropped by the per-well
+        # grouping downstream, taking the survey with it.
+        if d["well"].notna().any():
+            fill = d["well"].ffill().bfill()
+            d.loc[survey_only & d["well"].isna(), "well"] = fill[
+                survey_only & d["well"].isna()]
+
+    bad_gas = (d["q_gas"].isna() | (d["q_gas"] <= 0)) & ~survey_only
     if bad_gas.any():
         messages.append(f"{int(bad_gas.sum())} row(s) dropped: no positive gas "
                         "rate.")
@@ -306,6 +339,44 @@ def parse_paste_grid(edited: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         if c in d.columns and d[c].isna().all():
             d = d.drop(columns=[c])
     return d.reset_index(drop=True), messages
+
+
+def prepend_initial_pressure_row(frame: pd.DataFrame,
+                                 p_initial: float) -> pd.DataFrame:
+    """Write an estimated p_i into the grid as a survey at zero cumulative.
+
+    It goes in as its own row dated the day before first production rather
+    than into the first producing month's `p_res`, because those are different
+    quantities: the first month's cell means "pressure once that month's gas
+    had been produced", and the whole point of the estimate is the pressure
+    BEFORE any of it was. A row of its own is also visible and deletable,
+    which a number quietly dropped into an existing cell is not.
+    """
+    fr = align_to_paste_columns(frame) if not set(PASTE_COLUMNS) <= set(
+        frame.columns) else frame.copy()
+    dates = dca.parse_dates(fr["date"])
+    if dates.notna().any():
+        first = dates.min()
+        new_date = (first - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        well = ""
+        first_rows = fr.loc[dates == first, "well"]
+        if len(first_rows):
+            well = str(first_rows.iloc[0] or "")
+    else:
+        new_date, well = "", ""
+
+    # Replace a previous estimate rather than stacking another one on top.
+    keep = ~((dates.notna()) & (dates == dates.min())
+             & (pd.to_numeric(fr["q_gas"], errors="coerce").fillna(0) <= 0)
+             & (pd.to_numeric(fr["p_res"], errors="coerce").notna())
+             ) if dates.notna().any() else pd.Series(True, index=fr.index)
+    fr = fr[keep]
+
+    row = {c: np.nan for c in PASTE_COLUMNS}
+    row.update({"date": new_date, "well": well, "days_on": 0.0,
+                "p_res": float(p_initial)})
+    out = pd.concat([pd.DataFrame([row]), fr], ignore_index=True)
+    return align_to_paste_columns(out)
 
 
 @st.cache_resource(show_spinner=False)
@@ -420,6 +491,32 @@ def parse_pasted_text(text: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
+def estimate_pi(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
+                well_col: Optional[str], rate_basis: str, min_uptime: float,
+                outlier_sigma: float):
+    """Field initial pressure from the early p/z trend, or why it cannot be."""
+    raw = dca.map_columns(df)
+    groups = ({str(k): v for k, v in raw.groupby(well_col)}
+              if well_col and well_col in raw.columns else {"FIELD": raw})
+    prepared = {}
+    for name, grp in groups.items():
+        try:
+            prepared[name] = dca.ProductionData.prepare(
+                grp, _pvt, well=name, rate_basis=rate_basis,
+                min_uptime_frac=min_uptime,
+                outlier_sigma=(None if outlier_sigma <= 0 else outlier_sigma),
+                detect_bdf=False)
+        except Exception:
+            continue
+    if not prepared:
+        return None
+    try:
+        return dca.estimate_initial_pressure_from_wells(prepared, _pvt)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
 def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
                  settings: tuple, well_col: Optional[str]):
     """Analyse every well. Keyed on the dataframe, PVT signature and settings."""
@@ -514,8 +611,19 @@ with st.sidebar:
     mw_override = c2.number_input("Condensate MW (0 = Standing)", 0.0, 300.0,
                                   0.0, 1.0)
     c1, c2 = st.columns(2)
-    p_init = c1.number_input("Initial pressure (psia)", 200.0, 20000.0, 6400.0,
-                             50.0)
+    # Passing a default alongside a key that session state has already set
+    # makes Streamlit log a warning on every run, so the default is offered
+    # only the first time round.
+    _pi_default = ({} if "w_p_init" in st.session_state
+                   else {"value": 6400.0})
+    p_init = c1.number_input(
+        "Initial pressure (psia)", min_value=200.0, max_value=20000.0,
+        step=50.0, **_pi_default,
+        key="w_p_init",
+        help="Reservoir pressure at zero cumulative production — not the "
+             "first survey, which is almost always months into the life. If "
+             "it was never measured, the app offers to estimate it from the "
+             "early p/z trend once production data is loaded.")
     p_dew = c2.number_input("Dew point (psia)", 0.0, 20000.0, 5100.0, 50.0)
     initial_cgr = st.number_input(
         "Initial CGR (STB/MMscf)", 0.0, 500.0, 78.0, 1.0,
@@ -566,8 +674,12 @@ with st.sidebar:
                             value=False,
                             help="Biased low on a condensate well below the "
                                  "dew point - read it as a lower bound.")
+        _mb_default = ({} if "w_mb_pi" in st.session_state
+                       else {"value": 0.0})
         mb_pi = st.number_input(
-            "Material balance p_i (0 = extrapolate)", 0.0, 2.0e5, 0.0, 50.0,
+            "Material balance p_i (0 = extrapolate)", min_value=0.0,
+            max_value=2.0e5, step=50.0, **_mb_default,
+            key="w_mb_pi",
             help="Leave at 0 and the reference is extrapolated from the p/z "
                  "line to zero cumulative, which is what makes the answer "
                  "ORIGINAL gas in place rather than gas in place on the day "
@@ -708,12 +820,27 @@ if source == "Paste data":
     if st.session_state.pop("_clear_grid", False):
         st.session_state.pop("paste_editor", None)
         st.session_state["paste_frame"] = blank_paste_frame()
+    _pending_pi = st.session_state.pop("_stage_grid_pi", None)
+    if _pending_pi is not None:
+        # The editor's live contents, stashed on the previous run: rebuilding
+        # from `paste_frame` alone would silently undo anything typed since.
+        base_fr = st.session_state.get("_paste_current")
+        if base_fr is None:
+            base_fr = st.session_state.get("paste_frame", blank_paste_frame())
+        try:
+            st.session_state["paste_frame"] = prepend_initial_pressure_row(
+                base_fr, float(_pending_pi))
+            st.session_state.pop("paste_editor", None)
+        except Exception as exc:
+            st.warning(f"The estimate could not be written into the table "
+                       f"({exc}). It is still applied to the fluid definition.")
 
     paste_grid = st.data_editor(
         st.session_state.get("paste_frame", blank_paste_frame()),
         column_config=paste_column_config(), column_order=PASTE_COLUMNS,
         num_rows="dynamic", hide_index=True, key="paste_editor",
         height=440)
+    st.session_state["_paste_current"] = paste_grid
 
     b1, b2, b3 = st.columns([1, 1, 3])
     b1.button("Load a sample", on_click=lambda: st.session_state.update(
@@ -834,6 +961,156 @@ if "date" not in work_df.columns or "q_gas" not in work_df.columns:
 
 well_col = "well" if "well" in work_df.columns else None
 
+# ==============================================================================
+# Initial pressure
+# ==============================================================================
+# A gauge is almost never run before a well produces. The first static survey
+# arrives months in, by which time the reservoir has already given up pressure
+# nobody recorded. Taking that survey as p_i does not fail loudly - it quietly
+# redefines G as the gas in place on the day of the survey, drops everything
+# produced before it, and makes every Eg too small. So the app looks for the
+# gap and offers to close it rather than waiting to be asked.
+
+PI_MIN_GAP_DAYS = 45.0
+PI_MIN_RISE_FRAC = 0.01
+
+
+def pi_signature(df: pd.DataFrame, col: Optional[str]) -> str:
+    """Identify this dataset, so the prompt appears once per table."""
+    try:
+        d = dca.parse_dates(df["date"])
+        pres = pd.to_numeric(df.get("p_res"), errors="coerce") if (
+            "p_res" in df.columns) else pd.Series(dtype=float)
+        return "|".join(str(x) for x in (
+            len(df), col, d.min(), d.max(),
+            int(np.isfinite(pres).sum()) if len(pres) else 0,
+            round(float(np.nansum(pres)), 3) if len(pres) else 0.0,
+            round(float(pd.to_numeric(df["q_gas"], errors="coerce").sum()), 3)))
+    except Exception:
+        return str(len(df))
+
+
+def apply_pi(value: float) -> None:
+    """Park the estimate for the sidebar, the material balance and the grid."""
+    v = float(np.clip(value, 200.0, 20000.0))
+    st.session_state["_stage_p_init"] = v
+    st.session_state["_stage_mb_pi"] = float(np.clip(value, 0.0, 2.0e5))
+    st.session_state["_stage_grid_pi"] = v
+    st.session_state["_pi_applied"] = v
+    # Accepting the estimate edits the table, which changes its signature.
+    # Without this the next run would read that as a brand new dataset, clear
+    # the banner and offer the estimate all over again.
+    st.session_state["_pi_absorb_sig"] = True
+
+
+pi_sig = pi_signature(work_df, well_col)
+if st.session_state.get("_pi_data_sig") != pi_sig:
+    # A new table invalidates any estimate made against the old one.
+    st.session_state["_pi_data_sig"] = pi_sig
+    if st.session_state.pop("_pi_absorb_sig", False):
+        st.session_state["_pi_prompt_seen"] = pi_sig
+    else:
+        st.session_state.pop("_pi_prompt_seen", None)
+        st.session_state.pop("_pi_applied", None)
+
+pi_est = None
+if "p_res" in work_df.columns:
+    with st.spinner("Checking the pressure record..."):
+        try:
+            pi_est = estimate_pi(work_df, pvt, pvt_sig, well_col, rate_basis,
+                                 min_uptime, outlier_sigma)
+        except Exception:
+            pi_est = None
+
+
+def pi_gap_matters(e) -> bool:
+    if e is None or not e.ok:
+        return False
+    late = (np.isfinite(e.gap_days) and e.gap_days > PI_MIN_GAP_DAYS) or (
+        np.isfinite(e.gap_frac_ogip) and e.gap_frac_ogip > 0.02)
+    lifted = e.rise_psi > PI_MIN_RISE_FRAC * max(e.p_first_survey, 1.0)
+    return bool(late and lifted)
+
+
+def pi_body(e) -> None:
+    """The shared explanation, used by the dialog and by the inline panel."""
+    st.markdown(
+        f"The earliest static survey reads **{e.p_first_survey:,.0f} psia**, "
+        f"but it was taken **{e.gap_months:,.1f} months** into production, "
+        f"after **{e.gap_mmscf:,.0f} MMscf** had already been produced. "
+        "That is a pressure during depletion, not the initial pressure.")
+    g = st.columns(3)
+    g[0].metric("Estimated p_i", f"{e.p_initial:,.0f} psia",
+                f"{e.rise_psi:,.0f} psi above survey 1", delta_color="off")
+    g[1].metric("Range", f"{e.low:,.0f} – {e.high:,.0f}",
+                help="Spread across every early window that fits the same "
+                     "line, not a confidence interval.")
+    g[2].metric("Surveys used", f"{e.n_used} of {e.n_surveys}",
+                f"R² {e.r2:.4f}" if np.isfinite(e.r2) else None,
+                delta_color="off")
+    note(f"Method: {e.method}. p/z is straight against cumulative production "
+         "while depletion is volumetric, so the value where that line crosses "
+         "zero cumulative is p_i/z_i, and inverting it gives p_i. Only the "
+         "early surveys are used — pressure support flattens the late trend, "
+         "which pulls the intercept down and the OGIP up at the same time.")
+    for w in e.warnings:
+        warn(w[0].upper() + w[1:])
+
+
+@st.dialog("Initial pressure was never measured")
+def pi_dialog(e) -> None:
+    pi_body(e)
+    st.caption("Accepting writes the estimate into the fluid definition, uses "
+               "it as the material balance reference at zero cumulative, and "
+               "adds it to the table as a survey dated before first gas.")
+    a, b = st.columns(2)
+    if a.button("Estimate it", type="primary", width="stretch"):
+        apply_pi(e.p_initial)
+        st.session_state["_pi_prompt_seen"] = pi_sig
+        st.rerun()
+    if b.button("Leave it alone", width="stretch"):
+        st.session_state["_pi_prompt_seen"] = pi_sig
+        st.rerun()
+
+
+applied = st.session_state.get("_pi_applied")
+if applied is not None:
+    c1, c2 = st.columns([5, 1])
+    c1.success(
+        f"**Initial pressure estimated at {applied:,.0f} psia** and applied to "
+        "the fluid definition, the material balance reference and the table.")
+    if c2.button("Undo", width="stretch"):
+        st.session_state["_stage_p_init"] = 6400.0
+        st.session_state["_stage_mb_pi"] = 0.0
+        st.session_state.pop("_pi_applied", None)
+        st.rerun()
+elif pi_gap_matters(pi_est):
+    if st.session_state.get("_pi_prompt_seen") != pi_sig:
+        pi_dialog(pi_est)
+    else:
+        with st.expander(
+                f"Initial pressure was never measured — the first survey is "
+                f"{pi_est.gap_months:,.1f} months late", expanded=False):
+            pi_body(pi_est)
+            if st.button("Estimate it", type="primary", key="pi_late"):
+                apply_pi(pi_est.p_initial)
+                st.rerun()
+else:
+    reason = None
+    if "p_res" not in work_df.columns:
+        reason = ("there is no reservoir pressure in the data at all. "
+                  "Initial pressure cannot be inferred from rates alone — it "
+                  "needs at least two static surveys, a pre-production "
+                  "RFT/DST, or a regional pressure gradient.")
+    elif pi_est is not None and not pi_est.ok:
+        reason = pi_est.reason
+    if reason:
+        note(f"<b>No initial pressure.</b> {reason[0].upper()}{reason[1:]} "
+             "Enter it in the sidebar under <b>Initial pressure</b> if it is "
+             "known from an offset well or a regional gradient. The decline "
+             "fit, the yield model and the forecast do not need it; the "
+             "material balance does.")
+
 # -- fit window override ------------------------------------------------------
 window = None
 with st.expander("Decline fit window"):
@@ -846,8 +1123,8 @@ if not auto_window:
     try:
         probe = work_df if well_col is None else work_df[
             work_df[well_col] == sorted(work_df[well_col].astype(str).unique())[0]]
-        span_days = float((pd.to_datetime(probe["date"]).max()
-                           - pd.to_datetime(probe["date"]).min()).days)
+        pd_ = dca.parse_dates(probe["date"])
+        span_days = float((pd_.max() - pd_.min()).days)
     except Exception:
         span_days = 3650.0
     span_yr = max(span_days / dca.DAYS_PER_YEAR, 1.0)
@@ -1030,6 +1307,14 @@ with tabs[3]:
                     f"{mb.ho_rise:.2f}×" if np.isfinite(mb.ho_rise) else "n/a")
         k[3].metric("Drive", mb.drive.title())
         k[4].metric("Produced", f"{mb.gp_now:,.0f} MMscf")
+
+        if np.isfinite(mb.p_initial):
+            src = ("as entered in the sidebar" if mb.p_initial_known else
+                   "extrapolated from the p/z line to zero cumulative")
+            note(f"Reference pressure: <b>{mb.p_initial:,.0f} psia</b> at zero "
+                 f"cumulative, {src}. Every Eg and every F/Eg below is "
+                 "measured from it, so it is the single number this tab is "
+                 "most sensitive to.")
 
         if mb.impossible:
             warn(f"<b>Consistency guard.</b> Material balance requires "

@@ -690,6 +690,60 @@ def map_columns(df: pd.DataFrame,
     return out
 
 
+def _date_parse_score(v: pd.Series) -> Tuple[int, int, float]:
+    """Rank a candidate parse: valid rows, then order, then regularity."""
+    ok = v.notna()
+    n_ok = int(ok.sum())
+    if n_ok < 2:
+        return (n_ok, 0, -1e9)
+    d = v[ok].to_numpy("datetime64[ns]")
+    steps = np.diff(d).astype("timedelta64[s]").astype(float)
+    n_forward = int((steps > 0).sum())
+    pos = steps[steps > 0]
+    if pos.size == 0:
+        return (n_ok, n_forward, -1e9)
+    med = float(np.median(pos))
+    cv = float(np.std(pos) / med) if med > 0 else 1e9
+    return (n_ok, n_forward, -cv)
+
+
+def parse_dates(series: pd.Series) -> pd.Series:
+    """Parse a date column, deciding day-first vs month-first from the data.
+
+    `01/05/2012` is 1 May in most of the world and 5 January in the United
+    States, and nothing in the string says which. Pandas picks month-first and
+    does not complain, so a monthly production history written day-first comes
+    back as a dozen consecutive days in January and then jumps a year - the
+    rows stay in order, the cumulative still adds up, and every rate, decline
+    and pressure gap downstream is wrong by a factor of thirty.
+
+    Both readings are tried and the one that produces a well-formed history
+    wins: most rows parsed, then most steps moving forward in time, then the
+    most regular spacing. A genuinely ambiguous file - one that reads equally
+    well either way - keeps the pandas default.
+    """
+    s = pd.Series(series)
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s, errors="coerce")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cands = []
+        for first in (False, True):
+            try:
+                v = pd.to_datetime(s, errors="coerce", dayfirst=first,
+                                   format="mixed")
+            except Exception:
+                try:
+                    v = pd.to_datetime(s, errors="coerce", dayfirst=first)
+                except Exception:
+                    continue
+            cands.append((_date_parse_score(v), first, v))
+    if not cands:
+        return pd.to_datetime(s, errors="coerce")
+    cands.sort(key=lambda c: c[0], reverse=True)
+    return cands[0][2]
+
+
 @dataclass
 class QCReport:
     """What the QC step did, so it can be reported rather than hidden."""
@@ -788,7 +842,7 @@ class ProductionData:
         if "date" not in d.columns:
             raise ValueError("A date column is required.")
 
-        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        d["date"] = parse_dates(d["date"])
         d = d.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
         for col in ("q_gas", "q_cond", "q_water", "p_wf", "p_wh", "p_res", "days_on"):
@@ -842,7 +896,22 @@ class ProductionData:
         qc.n_zero_or_negative_gas = int(nonpos)
         if drop_leading_zeros:
             first_pos = d["q_gas"].gt(0).idxmax() if (d["q_gas"] > 0).any() else None
-            if first_pos is not None:
+            if first_pos is not None and first_pos > 0:
+                # A zero-rate row BEFORE first gas is usually a pre-production
+                # static survey - an RFT, a DST build-up, or an estimated p_i
+                # written back in. That is the single most valuable pressure
+                # point there is, because it is the only one paired with a
+                # cumulative of exactly zero. Dropping it with the other
+                # leading blanks throws away the reference the whole material
+                # balance is measured from.
+                lead = d.loc[:first_pos - 1]
+                keep_lead = np.zeros(len(lead), dtype=bool)
+                if "p_res" in lead.columns:
+                    keep_lead = np.isfinite(
+                        pd.to_numeric(lead["p_res"], errors="coerce")
+                    ).to_numpy()
+                d = pd.concat([lead[keep_lead], d.loc[first_pos:]])
+            elif first_pos is not None:
                 d = d.loc[first_pos:]
         if (d["q_gas"] > 0).sum() < 4:
             raise ValueError(f"[{well}] Fewer than 4 usable points after QC.")
@@ -2294,6 +2363,331 @@ def material_balance_pz(pressure: np.ndarray,
         p_initial=pi, p_initial_known=bool(pi_known), gp_now=gp_now,
         n_surveys=len(p), n_skipped=n_skipped)
 
+
+# ------------------------------------------------------------------------------
+# Initial reservoir pressure
+# ------------------------------------------------------------------------------
+
+@dataclass
+class InitialPressureEstimate:
+    """Initial reservoir pressure recovered from the early p/z trend.
+
+    Almost no well is shut in and gauged before it produces. The first static
+    survey lands months, sometimes years, into the life, by which time the
+    reservoir has already lost pressure. Treating that survey as p_i is not a
+    conservative approximation - it silently redefines G as the gas in place on
+    the day of the survey, so everything produced before it goes missing from
+    the answer, and it makes every Eg too small and every F/Eg too large, which
+    is what trips the We>=0 consistency guard on otherwise sound data.
+    """
+    ok: bool
+    p_initial: float = float("nan")     # psia at zero cumulative
+    low: float = float("nan")           # psia, spread across accepted windows
+    high: float = float("nan")
+    method: str = ""
+    reason: str = ""                    # why not, when ok is False
+    n_surveys: int = 0                  # available
+    n_used: int = 0                     # in the chosen early window
+    r2: float = float("nan")
+    pz_i: float = float("nan")
+    ogip_window_mmscf: float = float("nan")
+    gap_days: float = float("nan")      # first production to first survey
+    gap_mmscf: float = float("nan")     # produced before the first survey
+    gap_frac_ogip: float = float("nan")
+    reach: float = float("nan")         # gap / cumulative span of the window
+    p_first_survey: float = float("nan")
+    floor_psia: float = float("nan")    # highest pressure ever measured
+    rise_psi: float = float("nan")      # p_initial - p_first_survey
+    candidates: Optional[pd.DataFrame] = None
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def gap_months(self) -> float:
+        return self.gap_days / 30.4375 if np.isfinite(self.gap_days) else float("nan")
+
+    @property
+    def spread_psi(self) -> float:
+        return self.high - self.low
+
+    @property
+    def confident(self) -> bool:
+        """Tight spread, a clean line and a short throw back to Gp = 0."""
+        return bool(self.ok and np.isfinite(self.r2) and self.r2 >= 0.97
+                    and self.spread_psi <= 0.03 * max(self.p_initial, 1.0)
+                    and (not np.isfinite(self.reach) or self.reach <= 1.5))
+
+    def summary(self) -> str:
+        if not self.ok:
+            return f"Initial pressure not estimated: {self.reason}"
+        lines = [
+            "Initial pressure estimate",
+            "-" * 52,
+            f"  p_i               : {self.p_initial:,.0f} psia "
+            f"({self.low:,.0f} - {self.high:,.0f})",
+            f"  method            : {self.method}",
+            f"  surveys used      : {self.n_used} of {self.n_surveys} "
+            f"(R2 = {self.r2:.4f})",
+            f"  first survey      : {self.p_first_survey:,.0f} psia at "
+            f"{self.gap_mmscf:,.0f} MMscf, {self.gap_months:,.1f} months in",
+            f"  rise to p_i       : {self.rise_psi:,.0f} psi "
+            f"({100 * self.rise_psi / max(self.p_first_survey, 1.0):.1f} %)",
+            f"  OGIP of window    : {self.ogip_window_mmscf:,.0f} MMscf "
+            f"({100 * self.gap_frac_ogip:.1f} % produced before survey 1)",
+        ]
+        for w in self.warnings:
+            lines.append(f"  ! {w}")
+        return "\n".join(lines)
+
+
+def estimate_initial_pressure(pressure: np.ndarray,
+                              gp_mmscf: np.ndarray,
+                              pvt: PVT,
+                              *,
+                              two_phase: bool = True,
+                              method: str = "auto",
+                              t_days: Optional[np.ndarray] = None,
+                              p_wf_max: Optional[float] = None,
+                              r2_min: float = 0.97,
+                              stability_tol: float = 0.03,
+                              min_window: int = 3) -> InitialPressureEstimate:
+    """Back-extrapolate the EARLY p/z trend to zero cumulative.
+
+    p/z is straight against Gp while depletion is volumetric, so the value at
+    Gp = 0 is p_i/z_i and inverting it gives p_i. Two things make this more
+    than a one-line regression.
+
+    WHICH SURVEYS. Pressure support flattens the late trend, which rotates the
+    fitted line about the data and pulls its intercept DOWN - so a line through
+    every survey understates p_i at the same time as it overstates OGIP. The
+    estimate therefore comes from the earliest surveys only. The window is
+    chosen by growing it one survey at a time and stopping when the implied p_i
+    moves away from the level set by the first few: the same test, in the units
+    of the answer, that the apparent-G sequence applies to G.
+
+    HOW FAR IT REACHES. Extrapolating back across a gap much larger than the
+    span of the surveys used is a long throw on a line fitted to a short base,
+    and the result deserves the caveat rather than a decimal place. `reach`
+    reports the ratio and the warning fires above 1.5.
+
+    The answer can never be below a pressure that was actually measured, in the
+    well or in the reservoir, so both floors are enforced.
+    """
+    p = np.asarray(pressure, dtype=float)
+    g = np.asarray(gp_mmscf, dtype=float)
+    ok = np.isfinite(p) & np.isfinite(g) & (p > 0)
+    p, g = p[ok], g[ok]
+    t = None
+    if t_days is not None:
+        t = np.asarray(t_days, dtype=float)[ok]
+    order = np.argsort(g)
+    p, g = p[order], g[order]
+    if t is not None:
+        t = t[order]
+
+    n = len(p)
+    floor = float(np.max(p)) if n else float("nan")
+    if p_wf_max is not None and np.isfinite(p_wf_max):
+        floor = float(np.nanmax([floor, p_wf_max]))
+
+    base = InitialPressureEstimate(
+        ok=False, n_surveys=n, floor_psia=floor,
+        p_first_survey=float(p[0]) if n else float("nan"),
+        gap_mmscf=float(g[0]) if n else float("nan"),
+        gap_days=float(t[0]) if (t is not None and n) else float("nan"))
+
+    if n == 0:
+        base.reason = ("there is no reservoir pressure in the data at all. "
+                       "Initial pressure cannot be inferred from rates alone - "
+                       "it needs at least two static surveys, a pre-production "
+                       "RFT/DST, or a regional pressure gradient.")
+        return base
+    if n == 1:
+        base.reason = (f"only one static survey ({p[0]:,.0f} psia) is "
+                       "available, and a p/z line needs at least two. That "
+                       "survey is a lower bound on p_i, not p_i itself.")
+        return base
+
+    # -- candidate windows -------------------------------------------------
+    rows = []
+    for k in range(2, n + 1):
+        gk, pk = g[:k], p[:k]
+        if np.ptp(gk) <= 0:
+            continue
+        zk = pvt.z_two_phase(pk, method=method) if two_phase else pvt.z(pk)
+        pzk = pk / zk
+        res = stats.linregress(gk, pzk)
+        if res.slope >= 0:
+            continue
+        pz0 = float(res.intercept)
+        pi_k = float(pvt.pressure_from_pz(np.array([pz0]),
+                                          two_phase=two_phase)[0])
+        r2k = float(res.rvalue ** 2) if k > 2 else 1.0
+        rows.append({"n_surveys": k, "p_initial": pi_k, "pz_i": pz0,
+                     "r2": r2k, "ogip_mmscf": -pz0 / res.slope,
+                     "gp_span_mmscf": float(np.ptp(gk))})
+    if not rows:
+        base.reason = ("p/z does not decline with cumulative production over "
+                       "any early window - check the pressure units, the "
+                       "datum correction, or whether these are flowing "
+                       "pressures rather than static ones.")
+        return base
+
+    cand = pd.DataFrame(rows)
+
+    # -- choose the window -------------------------------------------------
+    # The reference level is the smallest window that can actually be judged.
+    # k = 2 has no residual and so no R2; k = 3 is the first fit with a degree
+    # of freedom, which is why it anchors the stability test rather than k = 2.
+    anchor_k = min(max(min_window, 3), int(cand["n_surveys"].max()))
+    anchor = cand.loc[cand["n_surveys"] <= anchor_k, "p_initial"].median()
+    acc = []
+    for _, r in cand.iterrows():
+        near = abs(r["p_initial"] / anchor - 1.0) <= stability_tol
+        clean = (r["n_surveys"] <= 3) or (r["r2"] >= r2_min)
+        if near and clean:
+            acc.append(int(r["n_surveys"]))
+        elif acc:
+            break                       # stop at the first departure, not the last
+    if not acc:
+        acc = [int(cand["n_surveys"].iloc[0])]
+    cand["used"] = cand["n_surveys"].isin(acc)
+
+    chosen = cand[cand["n_surveys"] == max(acc)].iloc[0]
+    accepted = cand[cand["used"]]
+    pi = float(chosen["p_initial"])
+    lo = float(accepted["p_initial"].min())
+    hi = float(accepted["p_initial"].max())
+
+    warns: List[str] = []
+    if np.isfinite(floor) and pi < floor:
+        warns.append(
+            f"the extrapolated value ({pi:,.0f} psia) came out below a "
+            f"pressure that was measured ({floor:,.0f} psia), which is "
+            "impossible; the measured pressure has been used instead.")
+        pi = floor
+        hi = max(hi, floor)
+        lo = max(lo, floor)
+    lo, hi = min(lo, pi), max(hi, pi)
+
+    span = float(chosen["gp_span_mmscf"])
+    gap = float(g[0])
+    reach = gap / span if span > 0 else float("inf")
+    ogip_w = float(chosen["ogip_mmscf"])
+
+    if reach > 1.5:
+        warns.append(
+            f"the extrapolation reaches back {gap:,.0f} MMscf from surveys "
+            f"that span only {span:,.0f} MMscf ({reach:.1f}x). Treat p_i as "
+            "an order of magnitude on the correction, not a measured number.")
+    if len(acc) < max(2, n - 1) and max(acc) < n:
+        warns.append(
+            f"surveys after the first {max(acc)} were excluded: the implied "
+            "p_i moves away from the early level there, which is the "
+            "signature of pressure support. That is the right thing for this "
+            "estimate, and it also means a straight-line OGIP through all "
+            f"{n} surveys will be too high.")
+    if np.isfinite(ogip_w) and ogip_w > 0 and gap / ogip_w > 0.15:
+        warns.append(
+            f"{100 * gap / ogip_w:.0f} % of the gas in place had already been "
+            "produced before the first survey. The unmeasured early depletion "
+            "is a large part of the answer.")
+    if max(acc) == 2:
+        warns.append("only two surveys support the line, so there is no "
+                     "residual and no way to tell whether it is straight.")
+
+    return InitialPressureEstimate(
+        ok=True, p_initial=pi, low=lo, high=hi,
+        method=(f"p/z back-extrapolation on the first {max(acc)} survey(s), "
+                f"{'two-phase' if two_phase else 'single-phase'} z"),
+        n_surveys=n, n_used=int(max(acc)), r2=float(chosen["r2"]),
+        pz_i=float(chosen["pz_i"]), ogip_window_mmscf=ogip_w,
+        gap_days=float(t[0]) if t is not None else float("nan"),
+        gap_mmscf=gap,
+        gap_frac_ogip=(gap / ogip_w if np.isfinite(ogip_w) and ogip_w > 0
+                       else float("nan")),
+        reach=reach, p_first_survey=float(p[0]), floor_psia=floor,
+        rise_psi=pi - float(p[0]),
+        candidates=cand.reset_index(drop=True), warnings=warns)
+
+
+def field_survey_table(wells: Dict[str, "ProductionData"]) -> pd.DataFrame:
+    """Pair every static survey in a field with the FIELD cumulative that day.
+
+    A tank has one pressure and one cumulative. With several wells on it, the
+    cumulative against which a survey must be read is the field's, not the
+    gauged well's - reading it against that one well's own production is the
+    commonest way a multi-well p/z plot ends up with a scatter of parallel
+    lines instead of one trend.
+    """
+    frames = []
+    for name, pdata in wells.items():
+        s = pdata.surveys
+        if len(s):
+            s = s.copy()
+            s["well"] = name
+            frames.append(s)
+    if not frames:
+        return pd.DataFrame(columns=["date", "p_res", "Gp_ws", "Wp_water",
+                                     "n_wells", "t"])
+    surv = pd.concat(frames, ignore_index=True).sort_values("date")
+
+    # Step-interpolate each well's cumulative onto the survey dates: a well
+    # contributes nothing before its own first production and its latest
+    # cumulative thereafter.
+    dates = pd.to_datetime(surv["date"]).to_numpy()
+    tot_g = np.zeros(len(surv))
+    tot_w = np.zeros(len(surv))
+    for _, pdata in wells.items():
+        src = pdata.full_df if pdata.full_df is not None else pdata.df
+        wd = pd.to_datetime(src["date"]).to_numpy()
+        for col, acc in (("Gp_ws", tot_g), ("Wp_water", tot_w)):
+            if col not in src.columns:
+                continue
+            v = pd.to_numeric(src[col], errors="coerce").ffill().fillna(0.0)
+            idx = np.searchsorted(wd, dates, side="right") - 1
+            acc += np.where(idx >= 0, v.to_numpy()[np.clip(idx, 0, None)], 0.0)
+
+    t0 = min(pd.to_datetime(
+        (p.full_df if p.full_df is not None else p.df)["date"]).min()
+        for p in wells.values())
+    out = pd.DataFrame({
+        "date": pd.to_datetime(surv["date"]).to_numpy(),
+        "well": surv["well"].to_numpy(),
+        "p_res": pd.to_numeric(surv["p_res"], errors="coerce").to_numpy(),
+        "p_wf": (pd.to_numeric(surv["p_wf"], errors="coerce").to_numpy()
+                 if "p_wf" in surv.columns else np.nan),
+        "Gp_ws": tot_g, "Wp_water": tot_w})
+    out["t"] = (out["date"] - t0).dt.days.astype(float)
+    # Two gauges run in the same month are two reads of one reservoir state.
+    agg = (out.groupby("date", as_index=False)
+              .agg(p_res=("p_res", "mean"), p_wf=("p_wf", "mean"),
+                   Gp_ws=("Gp_ws", "mean"), Wp_water=("Wp_water", "mean"),
+                   t=("t", "first"), n_wells=("well", "nunique")))
+    return agg.sort_values("Gp_ws").reset_index(drop=True)
+
+
+def estimate_initial_pressure_from_wells(
+        wells: Dict[str, "ProductionData"],
+        pvt: PVT, *, two_phase: bool = True,
+        method: str = "auto", **kwargs) -> InitialPressureEstimate:
+    """`estimate_initial_pressure` driven straight off prepared well data."""
+    surv = field_survey_table(wells)
+    p_wf_max = float("nan")
+    for _, pdata in wells.items():
+        src = pdata.full_df if pdata.full_df is not None else pdata.df
+        if "p_wf" in src.columns:
+            v = pd.to_numeric(src["p_wf"], errors="coerce")
+            if np.isfinite(v).any():
+                p_wf_max = float(np.nanmax([p_wf_max, np.nanmax(v)]))
+    if not len(surv):
+        return estimate_initial_pressure(
+            np.array([]), np.array([]), pvt, two_phase=two_phase,
+            method=method,
+            p_wf_max=(p_wf_max if np.isfinite(p_wf_max) else None), **kwargs)
+    return estimate_initial_pressure(
+        surv["p_res"].to_numpy(float), surv["Gp_ws"].to_numpy(float), pvt,
+        two_phase=two_phase, method=method, t_days=surv["t"].to_numpy(float),
+        p_wf_max=(p_wf_max if np.isfinite(p_wf_max) else None), **kwargs)
 
 
 # ------------------------------------------------------------------------------
@@ -3991,6 +4385,85 @@ def run_self_tests(verbose: bool = True) -> bool:
           fk0 is not None and fk0["We_mmbbl"] < 0.5
           and abs(fk0["G_mmscf"] / 55_000 - 1) < 0.02,
           f"We {fk0['We_mmbbl']:.3f} MMbbl, G {fk0['G_mmscf']:,.0f} MMscf")
+
+    # 9d2 -- day-first dates are recognised from the shape of the history
+    df_dates = pd.Series([f"01/{m:02d}/{y}" for y in (2012, 2013)
+                          for m in range(1, 13)])
+    got = parse_dates(df_dates)
+    check("a day-first monthly history is parsed day-first",
+          bool(got.is_monotonic_increasing)
+          and int(got.dt.day.nunique()) == 1
+          and (got.max() - got.min()).days > 300,
+          f"{got.iloc[0]:%Y-%m-%d} to {got.iloc[-1]:%Y-%m-%d}, "
+          f"{(got.max() - got.min()).days} days")
+    us = pd.Series(["03/15/2020", "04/15/2020", "05/15/2020", "06/15/2020"])
+    check("an unambiguous month-first history is left alone",
+          bool(parse_dates(us).is_monotonic_increasing)
+          and int(parse_dates(us).dt.month.iloc[0]) == 3,
+          f"{parse_dates(us).iloc[0]:%Y-%m-%d}")
+    check("dates already parsed pass straight through",
+          bool(parse_dates(pd.to_datetime(us)).equals(pd.to_datetime(us))),
+          "datetime64 input returned unchanged")
+
+    # 9e -- initial pressure recovered when the first survey is months late
+    # The surveys start at 12 % depletion, as they routinely do; nothing in
+    # the data says what p_i was, and the estimator has to put it back.
+    gp_late = np.linspace(0.12 * G, 0.55 * G, 7)
+    p_late = pvt_cvd.pressure_from_pz(pz_i * (1 - gp_late / G))
+    ip = estimate_initial_pressure(p_late, gp_late, pvt_cvd,
+                                   t_days=np.linspace(400, 2600, 7))
+    check("initial pressure recovered from late-starting surveys",
+          ip.ok and abs(ip.p_initial / pi - 1) < 0.01,
+          f"{ip.p_initial:,.0f} vs {pi:,.0f} psia, from {ip.n_used} of "
+          f"{ip.n_surveys} surveys, first survey {p_late[0]:,.0f} psia")
+    check("taking the first survey as p_i would have been far worse",
+          abs(p_late[0] / pi - 1) > 6 * abs(ip.p_initial / pi - 1),
+          f"first-survey error {100 * (p_late[0] / pi - 1):+.1f} % vs "
+          f"estimate {100 * (ip.p_initial / pi - 1):+.2f} %")
+
+    # Support on the late surveys must not drag the estimate down: the window
+    # has to stop where the trend leaves the early line.
+    gp_s = np.linspace(0.10 * G, 0.60 * G, 9)
+    p_s = pvt_cvd.pressure_from_pz(pz_i * (1 - gp_s / G))
+    p_s = p_s + np.where(gp_s > 0.32 * G,
+                         (gp_s - 0.32 * G) / (0.28 * G) * 520.0, 0.0)
+    ip_s = estimate_initial_pressure(p_s, gp_s, pvt_cvd)
+    all_fit = stats.linregress(gp_s, p_s / pvt_cvd.z_two_phase(p_s))
+    pi_all = float(pvt_cvd.pressure_from_pz(np.array([all_fit.intercept]))[0])
+    check("pressure support does not drag the p_i estimate down",
+          ip_s.ok and ip_s.n_used < len(gp_s)
+          and abs(ip_s.p_initial / pi - 1) < abs(pi_all / pi - 1),
+          f"early window {ip_s.p_initial:,.0f} ({ip_s.n_used} surveys) vs "
+          f"all-survey line {pi_all:,.0f}, truth {pi:,.0f} psia")
+
+    check("one survey is refused rather than mistaken for p_i",
+          not estimate_initial_pressure(p_late[:1], gp_late[:1], pvt_cvd).ok
+          and not estimate_initial_pressure(
+              np.array([]), np.array([]), pvt_cvd).ok,
+          "both the single-survey and the no-survey cases decline to answer")
+
+    check("the estimate is never below a measured pressure",
+          estimate_initial_pressure(
+              np.array([3000.0, 2800.0, 2600.0]),
+              np.array([0.0, 8000.0, 16000.0]), pvt_cvd
+          ).p_initial >= 3000.0,
+          "floored at the highest pressure on record")
+
+    # A pre-production survey must survive the leading-zero filter, because it
+    # is the one pressure paired with a cumulative of exactly zero.
+    df_pre = make_synthetic_well(pvt_cvd, ogip_mmscf=52000.0, n_months=90,
+                                 seed=12)
+    df_pre = pd.concat([
+        pd.DataFrame({"date": [df_pre["date"].iloc[0] - pd.Timedelta(days=1)],
+                      "q_gas": [0.0], "q_cond": [0.0], "p_res": [6400.0]}),
+        df_pre], ignore_index=True)
+    d_pre = ProductionData.prepare(df_pre, pvt_cvd, well="PRE")
+    s_pre = d_pre.surveys
+    check("a pre-production survey survives to the material balance",
+          len(s_pre) and abs(float(s_pre["p_res"].iloc[0]) - 6400.0) < 1e-6
+          and float(s_pre["Gp_ws"].iloc[0]) == 0.0,
+          f"{len(s_pre)} survey(s), first at Gp = "
+          f"{float(s_pre['Gp_ws'].iloc[0]):.1f} MMscf")
 
     # 9b -- the tank model is recovered end to end by the material balance
     df_t = make_synthetic_well(pvt_cvd, ogip_mmscf=52000.0,
