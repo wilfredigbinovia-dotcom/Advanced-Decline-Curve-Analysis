@@ -116,13 +116,27 @@ from scipy.interpolate import interp1d
 #   v2  dates fixed to ISO YYYY-MM-DD rather than guessed; the estimated-p_i
 #       row dated to the start of a month; a non-declining p/z diagnosed
 #       instead of aborting the material balance.
+#   v8  the About tab no longer quotes one well's numbers as general: every
+#       figure is either from the module's own verification case, named as
+#       such, or computed live from the well currently loaded. Limitations are
+#       written as conditions you can check against your own data.
+#   v7  what ends the well is now the earliest of gas rate, water rate, water
+#       cut and gas in place, with water forecast on its own trend; the liquid
+#       stream is checked against the ceiling the fluid sets and against water
+#       cut; the condensate bank is measured as lost productivity index.
+#   v6  Carter-Tracy transient aquifer alongside Fetkovich, with the fit,
+#       locus and health checks shared between them; Fevang-Whitson two-phase
+#       pseudo-pressure for the condensate bank, driven off the CVD liquid
+#       dropout column and a Corey relative permeability.
+#   v5  an About tab explaining decline curve analysis, what this tool does,
+#       and where it departs from the conventional method.
 #   v4  a CVD table quoted in percent - as lab reports are - is detected and
 #       converted rather than clipping every stage to 1 and flattening p/z.
 #   v3  a CVD table that does not span the survey pressures no longer flattens
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "4.0"
+__version__ = "8.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -136,6 +150,9 @@ __all__ = [
     "Forecast", "forecast_products", "monte_carlo_eur", "ProductSplit",
     "fetkovich_aquifer_fit", "havlena_odeh_gas", "gas_fvf_rb_per_scf",
     "OGIPChoice", "select_ogip", "fetkovich_health",
+    "RelPerm", "carter_tracy_aquifer_fit", "aquifer_fit",
+    "WaterTrend", "fit_water_trend", "LiquidCheck", "check_liquid_stream",
+    "WaterInLiquid", "diagnose_water_in_liquid", "BankDiagnostic", "bank_diagnostic",
     "InitialPressureEstimate", "estimate_initial_pressure",
     "estimate_initial_pressure_from_wells", "field_survey_table",
     "parse_dates", "DateFormatError", "percentiles_petroleum",
@@ -509,6 +526,78 @@ def rayes_two_phase_z(p: np.ndarray, T_R: float, gas_gravity: float,
 
 
 @dataclass
+class RelPerm:
+    """Corey relative permeability for the gas/condensate system.
+
+    Fevang and Whitson (1996) showed that gas condensate deliverability is
+    governed by the k_rg/k_ro RATIO as a function of saturation, and that the
+    answer is far less sensitive to the individual curves than to getting the
+    saturation right. That is what makes a Corey pair defensible here: the
+    liquid saturation comes from YOUR CVD liquid-dropout column, and these
+    exponents only shape how quickly that liquid costs the gas its path.
+
+    swi      irreducible water saturation
+    sorg     residual (immobile) condensate to gas
+    ng, no   Corey exponents for gas and condensate
+    krg_max  gas relative permeability at connate liquid
+    kro_max  condensate relative permeability at residual gas
+    """
+    swi: float = 0.20
+    sorg: float = 0.10
+    ng: float = 3.0
+    no: float = 3.0
+    krg_max: float = 0.8
+    kro_max: float = 0.4
+    # The CVD liquid-dropout column is a CELL AVERAGE, and the bank around the
+    # wellbore is richer than the reservoir average because it is fed by gas
+    # flowing in from everywhere. Fevang and Whitson set the near-wellbore
+    # saturation from the flowing CGR through a black-oil table this module
+    # does not ask for, so the ratio is exposed instead. At 1.0 the answer is
+    # the reservoir average, which UNDERSTATES the bank - a deliberate lower
+    # bound. Their published examples sit nearer 1.5 to 2.5.
+    bank_saturation_ratio: float = 1.0
+
+    def __post_init__(self):
+        if not 0.0 <= self.swi < 1.0:
+            raise ValueError("swi must be in [0, 1).")
+        if not 0.0 <= self.sorg < 1.0:
+            raise ValueError("sorg must be in [0, 1).")
+        if self.swi + self.sorg >= 1.0:
+            raise ValueError("swi + sorg must be below 1.")
+        if min(self.ng, self.no) <= 0:
+            raise ValueError("Corey exponents must be positive.")
+        if self.bank_saturation_ratio < 1.0:
+            raise ValueError("bank_saturation_ratio cannot be below 1: the "
+                             "bank is never leaner than the reservoir average.")
+
+    def krg(self, so) -> np.ndarray:
+        """Gas relative permeability at condensate saturation `so`.
+
+        Normalised on the hydrocarbon pore space, so k_rg = k_rg,max with no
+        liquid present and zero when liquid fills it. Normalising on the
+        MOBILE span instead - subtracting sorg from the denominator but not
+        from so - puts the clean-gas point above 1, where it clips, and the
+        curve then reports no mobility loss at all however much liquid drops
+        out.
+        """
+        so = np.clip(np.asarray(so, dtype=float), 0.0, 1.0 - self.swi)
+        sg_star = np.clip((1.0 - self.swi - so) / (1.0 - self.swi), 0.0, 1.0)
+        return self.krg_max * sg_star ** self.ng
+
+    def kro(self, so) -> np.ndarray:
+        """Condensate relative permeability at condensate saturation `so`.
+
+        Zero until the liquid exceeds `sorg`, which is what makes the bank a
+        trap: below that saturation the condensate is immobile, it is simply
+        in the way.
+        """
+        so = np.clip(np.asarray(so, dtype=float), 0.0, 1.0 - self.swi)
+        span = max(1.0 - self.swi - self.sorg, 1e-9)
+        so_star = np.clip((so - self.sorg) / span, 0.0, 1.0)
+        return self.kro_max * so_star ** self.no
+
+
+@dataclass
 class PVT:
     """Fluid property container and pseudo-pressure engine for a condensate gas.
 
@@ -542,6 +631,10 @@ class PVT:
     use_wellstream_gravity: bool = True
     initial_cgr: Optional[float] = None
     p_max_table: float = 15000.0
+    # Supplying this switches on the Fevang-Whitson two-phase pseudo-pressure.
+    # Left at None every two-phase quantity collapses to its single-phase
+    # counterpart, so the module behaves exactly as it did before.
+    relperm: Optional[RelPerm] = None
 
     # populated in __post_init__
     T_R: float = field(init=False)
@@ -623,6 +716,19 @@ class PVT:
         self._f_muct = interp1d(p, mu * cg, kind="cubic", bounds_error=False,
                                fill_value=(mu[0] * cg[0], mu[-1] * cg[-1]))
 
+        # Two-phase (Fevang-Whitson) pseudo-pressure: the same integrand
+        # weighted by the gas relative permeability along the depletion path.
+        # Built here so the FMB and the bank diagnostic interpolate rather than
+        # re-integrating on every call.
+        self._f_m2 = None
+        if self.relperm is not None:
+            krg_n = self.krg_of_p(p)
+            m2 = np.concatenate([[0.0],
+                                 cumulative_trapezoid(krg_n * integrand, p)])
+            self._m2_grid = m2
+            self._f_m2 = interp1d(p, m2, kind="cubic", bounds_error=False,
+                                  fill_value=(m2[0], m2[-1]))
+
         # Pre-sorted p/z -> p inverse. Built once here rather than rebuilt and
         # re-sorted on every call: the Fetkovich search inverts p/z tens of
         # thousands of times and that sort dominated the runtime.
@@ -686,6 +792,73 @@ class PVT:
                 z2 = z2 * (zd_single / zd_rayes)
             return np.where(p >= self.p_dew, single, z2)
         return z2
+
+    # -- Fevang-Whitson two-phase pseudo-pressure -------------------------
+    def condensate_saturation(self, p) -> np.ndarray:
+        """Retrograde condensate saturation in the pore space, from the CVD.
+
+        The CVD liquid-dropout column is the retrograde liquid as a fraction of
+        the DEW-POINT cell volume, i.e. of the hydrocarbon pore volume. Water
+        occupies `swi` of the pore space and takes no part in it, so
+
+            S_o = dropout * (1 - swi)
+
+        Without a dropout column there is nothing to work from and the answer
+        is zero saturation everywhere, which reduces every two-phase quantity
+        below to its single-phase counterpart rather than inventing a bank.
+        """
+        p = np.asarray(p, dtype=float)
+        if (self.cvd is None or self.cvd.liquid_dropout is None
+                or not np.any(np.isfinite(self.cvd.liquid_dropout))):
+            return np.zeros_like(p)
+        pr = self.cvd.pressure[::-1]
+        dr = np.asarray(self.cvd.liquid_dropout, dtype=float)[::-1]
+        so = np.interp(p, pr, dr, left=dr[0], right=0.0)
+        if self.p_dew:                       # no liquid above the dew point
+            so = np.where(p >= float(self.p_dew), 0.0, so)
+        swi = self.relperm.swi if self.relperm is not None else 0.0
+        ratio = (self.relperm.bank_saturation_ratio
+                 if self.relperm is not None else 1.0)
+        return np.clip(so * ratio, 0.0, 1.0) * (1.0 - swi)
+
+    def krg_of_p(self, p) -> np.ndarray:
+        """Gas relative permeability along the depletion path, normalised to 1
+        above the dew point where no liquid has dropped out."""
+        rp = self.relperm
+        if rp is None:
+            return np.ones_like(np.asarray(p, dtype=float))
+        so = self.condensate_saturation(p)
+        return np.clip(rp.krg(so) / max(rp.krg_max, 1e-12), 0.0, 1.0)
+
+    def m_two_phase(self, p) -> np.ndarray:
+        """Two-phase pseudo-pressure for GAS deliverability, psia^2/cp.
+
+            m*(p) = int_0^p  [k_rg(p') / k_rg,max] * 2p'/(mu z) dp'
+
+        Below the dew point retrograde liquid drops out around the wellbore and
+        takes relative permeability away from the gas. The single-phase m(p)
+        knows nothing about it, so a flowing material balance attributes the
+        lost deliverability to a smaller reservoir and reads low. Weighting the
+        integrand by k_rg puts the bank where it belongs - in the mobility, not
+        in the volume.
+
+        The solution-gas term of the full Fevang-Whitson integral,
+        R_s*k_ro/(mu_o B_o), is NOT included: it needs a black-oil table this
+        module does not ask for. Leaving it out understates m*, which is
+        conservative for deliverability and makes the FMB correction slightly
+        smaller than the truth rather than larger.
+
+        With no CVD dropout column or no relative permeability defined this
+        returns exactly `m(p)`, so it is always safe to call.
+        """
+        p = np.asarray(p, dtype=float)
+        if self.relperm is None or self._f_m2 is None:
+            return self.m(p)
+        return np.asarray(self._f_m2(p), dtype=float)
+
+    def bank_mobility_loss(self, p) -> np.ndarray:
+        """1 - k_rg/k_rg,max: the fraction of gas mobility the bank has taken."""
+        return 1.0 - self.krg_of_p(p)
 
     def pressure_from_pz(self, pz, two_phase: bool = True) -> np.ndarray:
         """Invert p/z -> p on the internal grid (the mapping is monotonic)."""
@@ -2217,6 +2390,254 @@ def fit_yield_model(Gp: np.ndarray, cgr: np.ndarray,
 # ==============================================================================
 
 @dataclass
+class LiquidCheck:
+    """Is the reported liquid something the fluid can actually produce?
+
+    Below the dew point a retrograde gas gets LEANER: the heavy ends drop out
+    in the reservoir and stay there, so the produced condensate-gas ratio falls
+    away from its initial value and cannot climb back past it. Above the dew
+    point it sits AT that value. Either way the initial CGR is a ceiling on the
+    produced CGR, and a produced ratio above it is not reservoir behaviour.
+
+    What it usually is: water in the liquid stream - an emulsion that the
+    separator never split, or a test that measured total liquid - or a drifting
+    allocation factor. All three inflate reserves, none of them show up as an
+    error anywhere else, and the fluid report already on file is enough to
+    catch them.
+    """
+    ok: bool
+    initial_cgr: float = float("nan")
+    cgr_median_recent: float = float("nan")
+    cgr_max: float = float("nan")
+    ratio_recent: float = float("nan")          # recent CGR / initial
+    implied_non_condensate: float = float("nan")  # fraction of the liquid
+    n_periods_over: int = 0
+    n_periods: int = 0
+    by_year: Optional[pd.DataFrame] = None
+    reason: str = ""
+
+    @property
+    def exceeds(self) -> bool:
+        return bool(self.ok and np.isfinite(self.ratio_recent)
+                    and self.ratio_recent > 1.0)
+
+    def summary(self) -> str:
+        if not self.ok:
+            return f"  liquid check      : not run ({self.reason})"
+        if not self.exceeds:
+            return (f"  liquid check      : produced CGR "
+                    f"{self.cgr_median_recent:,.0f} vs initial "
+                    f"{self.initial_cgr:,.0f} STB/MMscf - consistent")
+        return (f"  liquid check      : produced CGR "
+                f"{self.cgr_median_recent:,.0f} is {self.ratio_recent:.1f}x "
+                f"the initial {self.initial_cgr:,.0f} STB/MMscf, which a "
+                f"depleting retrograde gas cannot do\n"
+                f"                      implied non-condensate fraction of "
+                f"the liquid: {100 * self.implied_non_condensate:.0f} % "
+                f"({self.n_periods_over} of {self.n_periods} periods over)")
+
+
+def check_liquid_stream(cgr: np.ndarray, initial_cgr: Optional[float],
+                        dates: Optional[pd.Series] = None,
+                        recent_periods: int = 12,
+                        tolerance: float = 1.05) -> LiquidCheck:
+    """Compare produced CGR against the ceiling the fluid itself sets."""
+    if initial_cgr is None or not np.isfinite(initial_cgr) or initial_cgr <= 0:
+        return LiquidCheck(ok=False, reason="no initial CGR supplied")
+    c = np.asarray(cgr, dtype=float)
+    c = c[np.isfinite(c) & (c > 0)]
+    if c.size < 4:
+        return LiquidCheck(ok=False, reason="fewer than four periods with a CGR")
+
+    recent = c[-min(recent_periods, c.size):]
+    med = float(np.median(recent))
+    ratio = med / float(initial_cgr)
+    by_year = None
+    if dates is not None and len(dates) >= c.size:
+        try:
+            d = pd.DataFrame({"year": pd.to_datetime(dates).dt.year[-c.size:],
+                              "cgr": c})
+            by_year = (d.groupby("year", as_index=False)["cgr"].median()
+                       .assign(ratio=lambda x: x["cgr"] / float(initial_cgr)))
+            by_year["implied_non_condensate"] = np.clip(
+                1.0 - 1.0 / by_year["ratio"].where(by_year["ratio"] > 0), 0, 1)
+        except Exception:
+            by_year = None
+
+    return LiquidCheck(
+        ok=True, initial_cgr=float(initial_cgr), cgr_median_recent=med,
+        cgr_max=float(np.max(c)), ratio_recent=float(ratio),
+        implied_non_condensate=float(max(0.0, 1.0 - 1.0 / ratio))
+        if ratio > 0 else float("nan"),
+        n_periods_over=int(np.sum(c > initial_cgr * tolerance)),
+        n_periods=int(c.size), by_year=by_year)
+
+
+@dataclass
+class WaterInLiquid:
+    """Does the CGR rise BECAUSE water is rising? Regression, not assertion."""
+    ok: bool
+    correlation: float = float("nan")       # Spearman, CGR vs water cut
+    p_value: float = float("nan")
+    clean_cgr: float = float("nan")         # CGR extrapolated to zero water cut
+    slope: float = float("nan")
+    r2: float = float("nan")
+    n: int = 0
+    reason: str = ""
+
+    @property
+    def water_driven(self) -> bool:
+        return bool(self.ok and np.isfinite(self.p_value)
+                    and self.p_value < 0.05 and self.correlation > 0.5)
+
+    def summary(self) -> str:
+        if not self.ok:
+            return f"  water-in-liquid   : not run ({self.reason})"
+        verdict = ("CGR tracks water cut - the extra liquid is water"
+                   if self.water_driven else
+                   "CGR does not track water cut")
+        return (f"  water-in-liquid   : rho {self.correlation:+.2f} "
+                f"(p {self.p_value:.1e}, n={self.n}) - {verdict}\n"
+                f"                      CGR extrapolated to zero water cut: "
+                f"{self.clean_cgr:,.0f} STB/MMscf")
+
+
+def diagnose_water_in_liquid(cgr: np.ndarray, q_water: np.ndarray,
+                             q_cond: np.ndarray) -> WaterInLiquid:
+    """Regress CGR on water cut. The intercept is the CGR without the water.
+
+    A retrograde reservoir has no mechanism to raise its yield as water
+    arrives, so a CGR that climbs in step with water cut is measuring the
+    water. Extrapolating the line back to zero water cut gives the condensate
+    yield the stream would have had without it - which can be compared against
+    the fluid's initial CGR as an independent check on the same story.
+    """
+    c = np.asarray(cgr, dtype=float)
+    w = np.asarray(q_water, dtype=float)
+    o = np.asarray(q_cond, dtype=float)
+    liq = w + o
+    ok = (np.isfinite(c) & np.isfinite(w) & np.isfinite(o) & (c > 0)
+          & (liq > 0))
+    if int(ok.sum()) < 8:
+        return WaterInLiquid(ok=False,
+                             reason="fewer than eight periods with water and "
+                                    "condensate")
+    c, wcut = c[ok], (w / liq)[ok]
+    if float(np.ptp(wcut)) < 0.02:
+        return WaterInLiquid(ok=False, reason="water cut barely varies")
+    rho, pv = stats.spearmanr(wcut, c)
+    res = stats.linregress(wcut, c)
+    return WaterInLiquid(
+        ok=True, correlation=float(rho), p_value=float(pv),
+        clean_cgr=float(res.intercept), slope=float(res.slope),
+        r2=float(res.rvalue ** 2), n=int(len(c)))
+
+
+@dataclass
+class BankDiagnostic:
+    """Productivity index against time: the condensate bank, measured.
+
+    PI = q / [m(p_res) - m(p_wf)] already divides out the drawdown and the gas
+    properties, so what is left is mobility and contacted volume. On a
+    condensate well it falls once the reservoir drops below the dew point, and
+    the size of that fall is the bank expressed in the only units that matter
+    to a forecast - lost deliverability.
+    """
+    ok: bool
+    t_days: Optional[np.ndarray] = None
+    pi: Optional[np.ndarray] = None
+    p_avg: Optional[np.ndarray] = None
+    pi_initial: float = float("nan")
+    pi_final: float = float("nan")
+    loss_frac: float = float("nan")
+    trend_pct_per_year: float = float("nan")
+    r2: float = float("nan")
+    p_dew_crossed_days: Optional[float] = None
+    reason: str = ""
+
+    def summary(self) -> str:
+        if not self.ok:
+            return f"  bank diagnostic   : not run ({self.reason})"
+        return (f"  bank diagnostic   : PI fell {100 * self.loss_frac:,.0f} % "
+                f"({self.pi_initial:,.3g} -> {self.pi_final:,.3g}), trend "
+                f"{self.trend_pct_per_year:+,.0f} %/yr (R2 {self.r2:.2f})")
+
+
+def bank_diagnostic(t_days: np.ndarray, q_ws: np.ndarray, gp_mmscf: np.ndarray,
+                    p_wf: Optional[np.ndarray], pvt: PVT,
+                    ogip_mmscf: Optional[float], p_initial: Optional[float],
+                    two_phase: bool = True,
+                    t_min: Optional[float] = None) -> BankDiagnostic:
+    """Track q / [m(p_avg) - m(p_wf)] over the producing history.
+
+    Average reservoir pressure comes from the material balance at the chosen
+    gas in place, so this needs an OGIP and a p_i; without them there is no
+    p_avg and the index cannot be formed.
+
+    `t_min` excludes the facility plateau, and it matters more here than
+    anywhere else in the module. On plateau the rate is held constant by the
+    choke while the reservoir depletes, so the drawdown needed to deliver it
+    shrinks and the index RISES - on the worked example by enough to cancel
+    the later fall entirely and report the bank as +4 %/yr. Feed it the same
+    window the decline is fitted on: the part where the reservoir, not the
+    facility, is setting the rate.
+    """
+    if p_wf is None:
+        return BankDiagnostic(ok=False, reason="no flowing pressure column")
+    if ogip_mmscf is None or not np.isfinite(ogip_mmscf) or ogip_mmscf <= 0:
+        return BankDiagnostic(ok=False, reason="no gas in place to set p_avg")
+    if p_initial is None or not np.isfinite(p_initial) or p_initial <= 0:
+        return BankDiagnostic(ok=False, reason="no initial pressure")
+
+    t = np.asarray(t_days, float)
+    q = np.asarray(q_ws, float)
+    g = np.asarray(gp_mmscf, float)
+    pw = np.asarray(p_wf, float)
+    ok = np.isfinite(t) & np.isfinite(q) & np.isfinite(g) & np.isfinite(pw) \
+        & (q > 0) & (pw > 0)
+    if int(ok.sum()) < 6:
+        return BankDiagnostic(ok=False,
+                              reason="fewer than six periods with a flowing "
+                                     "pressure")
+    t, q, g, pw = t[ok], q[ok], g[ok], pw[ok]
+    if t_min is not None and np.isfinite(t_min):
+        keep = t >= float(t_min)
+        if int(keep.sum()) >= 6:
+            t, q, g, pw = t[keep], q[keep], g[keep], pw[keep]
+
+    pz_i = float(p_initial) / float(
+        pvt.z_two_phase(np.array([float(p_initial)]))[0] if two_phase
+        else pvt.z(np.array([float(p_initial)]))[0])
+    p_avg = pvt.pressure_from_pz(
+        pz_i * (1.0 - np.clip(g / float(ogip_mmscf), 0.0, 0.999)),
+        two_phase=two_phase)
+    dm = pvt.m(p_avg) - pvt.m(pw)
+    good = dm > 0
+    if int(good.sum()) < 6:
+        return BankDiagnostic(ok=False,
+                              reason="flowing pressure is not below the "
+                                     "average reservoir pressure")
+    t, q, p_avg, dm = t[good], q[good], p_avg[good], dm[good]
+    pi_series = q / dm
+
+    res = stats.linregress(t / DAYS_PER_YEAR, np.log(pi_series))
+    n_edge = max(3, len(pi_series) // 10)
+    pi0 = float(np.median(pi_series[:n_edge]))
+    pi1 = float(np.median(pi_series[-n_edge:]))
+    crossed = None
+    if pvt.p_dew:
+        below = np.flatnonzero(p_avg < float(pvt.p_dew))
+        if below.size:
+            crossed = float(t[int(below[0])])
+    return BankDiagnostic(
+        ok=True, t_days=t, pi=pi_series, p_avg=p_avg,
+        pi_initial=pi0, pi_final=pi1,
+        loss_frac=float(1.0 - pi1 / pi0) if pi0 > 0 else float("nan"),
+        trend_pct_per_year=float(100.0 * (math.exp(res.slope) - 1.0)),
+        r2=float(res.rvalue ** 2), p_dew_crossed_days=crossed)
+
+
+@dataclass
 class MaterialBalanceResult:
     """p/z straight line plus the Havlena-Odeh diagnostics that police it.
 
@@ -3233,34 +3654,152 @@ def _fetkovich_march(g_scf: float, wei_bbl: float, tau_days: float,
     return p_pred
 
 
-def fetkovich_aquifer_fit(t_days: np.ndarray,
-                          pressure: np.ndarray,
-                          gp_mmscf: np.ndarray,
-                          pvt: PVT,
-                          p_initial: float,
-                          water_mstb: Optional[np.ndarray] = None,
-                          two_phase: bool = True,
-                          method: str = "auto",
-                          bw: float = 1.0,
-                          g_grid: int = 10,
-                          wei_grid: int = 11,
-                          tau_grid: int = 11,
-                          g_max_multiple: float = 6.0,
-                          locus_tolerance: float = 1.08,
-                          refine: bool = True) -> Optional[Dict]:
-    """Fit a Fetkovich aquifer to a pressure history: returns G, Wei, J and We.
+def _pd_edwardson(td: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Dimensionless pressure and its derivative for an infinite radial aquifer.
 
-    The search is over (G, Wei, tau) rather than (G, Wei, J), because tau =
-    Wei/(J*p_i) is the aquifer's response time in days and is the thing the data
-    can actually constrain. J falls out as Wei/(p_i*tau).
+    Edwardson et al. (1962) rational approximations to the van Everdingen-Hurst
+    constant-terminal-rate solution, switching to the line-source logarithm
+    above t_D = 100 where the two agree to well under a percent.
+    """
+    td = np.maximum(np.asarray(td, dtype=float), 1e-8)
+    r = np.sqrt(td)
+    small_pd = ((370.529 * r + 137.582 * td + 5.69549 * td * r)
+                / (328.834 + 265.488 * r + 45.2157 * td + td * r))
+    small_pdp = ((716.441 + 46.7984 * r + 270.038 * td + 71.0098 * td * r)
+                 / (1296.86 * r + 1204.73 * td + 618.618 * td * r
+                    + 538.072 * td ** 2 + 142.41 * td ** 2 * r))
+    big_pd = 0.5 * (np.log(td) + 0.80907)
+    big_pdp = 0.5 / td
+    use_big = td > 100.0
+    return (np.where(use_big, big_pd, small_pd),
+            np.where(use_big, big_pdp, small_pdp))
+
+
+def _carter_tracy_march(g_scf: float, bprime: float, td_scale: float,
+                        t_days: np.ndarray, gp_scf: np.ndarray,
+                        wp_bbl: np.ndarray, pvt: PVT, pi: float, bgi: float,
+                        bw: float, two_phase: bool, n_inner: int = 12
+                        ) -> np.ndarray:
+    """March the tank forward with a Carter-Tracy aquifer.
+
+    Carter and Tracy (1960) approximate van Everdingen-Hurst WITHOUT
+    superposition, by assuming the influx rate is constant over each step:
+
+        We_n = We_(n-1) + (t_Dn - t_D(n-1)) *
+               [ B' dp_n - We_(n-1) p'_D(t_Dn) ]
+               / [ p_D(t_Dn) - t_D(n-1) p'_D(t_Dn) ]
+
+    where dp_n = p_i - p_res(t_n). That recursion is what makes it usable on a
+    sparse survey record: VEH proper needs the full pressure history convolved
+    at every step, and nine build-ups do not supply one.
+
+    What it buys over Fetkovich is the EARLY response. Fetkovich is
+    pseudo-steady from t = 0, so it cannot produce the large initial influx of
+    an aquifer still in transient flow, and it compensates by inflating Wei.
+    Carter-Tracy carries the transient explicitly through p_D(t_D).
+
+    Parameters are (B', t_D scale) rather than the usual rock and fluid list:
+    B' = 1.119 phi c_t r_o^2 h f collapses into one number in bbl/psi, and
+    t_D = (6.328e-3 k / (phi mu c_t r_o^2)) * t collapses into one rate per
+    day. Fitting those two is fitting everything the data can distinguish.
+    """
+    n = len(t_days)
+    p_pred = np.empty(n, dtype=float)
+    p_pred[0] = pi
+    we = 0.0
+    c = 0.0050346 * pvt.T_R
+    td_all = np.maximum(np.asarray(t_days, float) - float(t_days[0]), 0.0) * td_scale
+    pd_all, pdp_all = _pd_edwardson(np.maximum(td_all, 1e-8))
+
+    for i in range(1, n):
+        td_now, td_prev = td_all[i], td_all[i - 1]
+        pd_now, pdp_now = float(pd_all[i]), float(pdp_all[i])
+        denom_ct = pd_now - td_prev * pdp_now
+        if not np.isfinite(denom_ct) or abs(denom_ct) < 1e-12:
+            return np.full(n, np.nan)
+        p_prev = p_pred[i - 1]
+        p_now = p_prev
+        we_new = we
+        for _ in range(n_inner):
+            # Carter-Tracy takes the pressure drop at the END of the step; the
+            # average is used here for the same reason Fetkovich does, so a
+            # sparse survey spacing does not overshoot.
+            dp = pi - 0.5 * (p_prev + p_now)
+            we_new = we + (td_now - td_prev) * (
+                (bprime * dp - we * pdp_now) / denom_ct)
+            we_new = max(we_new, 0.0)
+            # The Carter-Tracy recursion assumes the influx rate is constant
+            # over the step. Push it too hard and it oscillates - pressure
+            # rising and falling by thousands of psi between surveys - and the
+            # optimiser will happily sit in that region because some of those
+            # swings pass near the data. An aquifer whose own pressure never
+            # exceeds p_i cannot drive the reservoir above p_i either, so that
+            # is a physical rejection, not a numerical patch.
+            if we_new > g_scf * bgi + wp_bbl[i] * bw:
+                return np.full(n, np.nan)
+            denom = g_scf - gp_scf[i]
+            if denom <= 0:
+                return np.full(n, np.nan)
+            bg = (g_scf * bgi - we_new + wp_bbl[i] * bw) / denom
+            if not np.isfinite(bg) or bg <= 0:
+                return np.full(n, np.nan)
+            p_new = float(pvt.pressure_from_pz(np.array([c / bg]),
+                                               two_phase=two_phase)[0])
+            if p_new > pi * 1.001:
+                return np.full(n, np.nan)
+            if abs(p_new - p_now) < 0.05:
+                p_now = p_new
+                break
+            p_now = 0.5 * p_now + 0.5 * p_new
+        we = we_new
+        p_pred[i] = p_now
+    return p_pred
+
+
+def aquifer_fit(t_days: np.ndarray,
+                pressure: np.ndarray,
+                gp_mmscf: np.ndarray,
+                pvt: PVT,
+                p_initial: float,
+                water_mstb: Optional[np.ndarray] = None,
+                two_phase: bool = True,
+                method: str = "auto",
+                bw: float = 1.0,
+                model: str = "fetkovich",
+                g_grid: int = 10,
+                a_grid: int = 11,
+                b_grid: int = 11,
+                g_max_multiple: float = 6.0,
+                locus_tolerance: float = 1.08,
+                refine: bool = True) -> Optional[Dict]:
+    """Fit an aquifer to a pressure history: returns G, the influx and a locus.
+
+    `model` selects the influx law:
+
+      'fetkovich'    pseudo-steady from t = 0. Two parameters, (Wei, tau).
+                     Robust and cheap, but it cannot produce the large early
+                     influx of an aquifer still in transient flow, so it
+                     compensates by inflating Wei.
+      'carter_tracy' van Everdingen-Hurst transient, evaluated by the
+                     Carter-Tracy recursion so no superposition is needed.
+                     Two parameters, (B', t_D scale). Captures the early
+                     response Fetkovich misses.
+
+    The search is over (G, a, b) where a and b are the model's two aquifer
+    parameters, chosen in each case to be the groupings the data can actually
+    constrain rather than the rock and fluid properties behind them.
 
     **The solution is not unique, and the locus is the honest output.** A large
-    aquifer with a small J and a small aquifer with a large J deliver nearly the
-    same influx over a finite record; only late depletion of the aquifer itself
-    separates them. The returned `locus` holds every grid triplet within
-    `locus_tolerance` of the best rms, and it is usually a long valley rather
-    than a point. Quote a range from it, not the single best triplet.
+    aquifer with a small conductivity and a small aquifer with a large one
+    deliver nearly the same influx over a finite record; only late depletion of
+    the aquifer itself separates them. `g_range_mmscf` is the range of gas in
+    place that fits within `locus_tolerance` of the best rms. Quote that range,
+    not the single best triplet.
     """
+    model = (model or "fetkovich").lower().replace("-", "_").replace(" ", "_")
+    if model not in ("fetkovich", "carter_tracy"):
+        raise ValueError(f"Unknown aquifer model {model!r}.")
+
     t = np.asarray(t_days, dtype=float)
     p = np.asarray(pressure, dtype=float)
     g = np.asarray(gp_mmscf, dtype=float)
@@ -3284,101 +3823,110 @@ def fetkovich_aquifer_fit(t_days: np.ndarray,
     g_lo = 1.05 * gp_max
     g_hi = max(g_max_multiple * gp_max, g_lo * 1.5)
     span = max(float(t[-1] - t[0]), 1.0)
+    hcpv0 = gp_max * bgi
 
     # Bounds are enforced inside the objective so every caller - the grid, the
     # global refine and the profile - obeys them. Without this the optimiser
     # wanders off to an aquifer of 10^10 MMbbl with a 10^13-day time constant,
     # which is numerically an inert tank and physically nothing at all.
-    hcpv0 = gp_max * bgi
-    wei_lo, wei_hi = 1.0e-3 * hcpv0, 1.0e4 * hcpv0
-    tau_lo, tau_hi = 1.0e-3 * span, 1.0e4 * span
+    if model == "fetkovich":
+        march = _fetkovich_march
+        a_lo, a_hi = 1.0e-3 * hcpv0, 1.0e4 * hcpv0            # Wei, bbl
+        b_lo, b_hi = 1.0e-3 * span, 1.0e4 * span              # tau, days
+        a_vals = np.geomspace(0.05 * hcpv0, 200.0 * hcpv0, a_grid)
+        b_vals = np.geomspace(0.02 * span, 200.0 * span, b_grid)
+        a_name, b_name = "Wei_bbl", "tau_days"
+    else:
+        march = _carter_tracy_march
+        a_lo, a_hi = 1.0e-3 * hcpv0 / pi, 1.0e4 * hcpv0 / pi  # B', bbl/psi
+        b_lo, b_hi = 1.0e-4 / span, 1.0e5 / span              # t_D per day
+        a_vals = np.geomspace(0.05 * hcpv0 / pi, 200.0 * hcpv0 / pi, a_grid)
+        b_vals = np.geomspace(0.02 / span, 2000.0 / span, b_grid)
+        a_name, b_name = "Bprime_bbl_psi", "td_scale_per_day"
 
-    def rms(gv: float, weiv: float, tauv: float) -> float:
-        if gv <= g_lo * 0.999 or weiv <= 0 or tauv <= 0:
+    def rms(gv: float, av: float, bv: float) -> float:
+        if gv <= g_lo * 0.999 or av <= 0 or bv <= 0:
             return np.inf
-        if not (wei_lo <= weiv <= wei_hi) or not (tau_lo <= tauv <= tau_hi):
+        if not (a_lo <= av <= a_hi) or not (b_lo <= bv <= b_hi):
             return np.inf
-        pp = _fetkovich_march(gv, weiv, tauv, t, gp_scf, wp_bbl, pvt, pi,
-                              bgi, bw, two_phase)
+        pp = march(gv, av, bv, t, gp_scf, wp_bbl, pvt, pi, bgi, bw, two_phase)
         if not np.all(np.isfinite(pp)):
             return np.inf
         return float(np.sqrt(np.mean(((pp - p) / p) ** 2)) * 100.0)
 
-    # Wei is scaled to the reservoir volume of the gas produced so far, so the
-    # grid spans the same physical range whatever the size of the field.
-    hcpv_bbl = hcpv0
     gs = np.geomspace(g_lo, g_hi, g_grid)
-    weis = np.geomspace(0.05 * hcpv_bbl, 200.0 * hcpv_bbl, wei_grid)
-    taus = np.geomspace(0.02 * span, 200.0 * span, tau_grid)
-
-    rows = []
     best = (np.inf, None)
     for gv in gs:
-        for wv in weis:
-            for tv in taus:
-                e = rms(gv, wv, tv)
-                if np.isfinite(e):
-                    rows.append((gv, wv, tv, e))
-                    if e < best[0]:
-                        best = (e, (gv, wv, tv))
+        for av in a_vals:
+            for bv in b_vals:
+                e = rms(gv, av, bv)
+                if e < best[0]:
+                    best = (e, (gv, av, bv))
     if best[1] is None:
         return None
 
-    gb, wb, tb = best[1]
+    gb, ab, bb = best[1]
     if refine:
         def obj(x):
             return rms(math.exp(x[0]), math.exp(x[1]), math.exp(x[2]))
         try:
             sol = optimize.minimize(
-                obj, np.log([gb, wb, tb]), method="Nelder-Mead",
+                obj, np.log([gb, ab, bb]), method="Nelder-Mead",
                 options=dict(maxiter=400, xatol=1e-3, fatol=1e-4))
             if np.isfinite(sol.fun) and sol.fun < best[0]:
-                gb, wb, tb = (math.exp(v) for v in sol.x)
-                best = (float(sol.fun), (gb, wb, tb))
+                gb, ab, bb = (math.exp(v) for v in sol.x)
+                best = (float(sol.fun), (gb, ab, bb))
         except Exception:
             pass
 
-    p_pred = _fetkovich_march(gb, wb, tb, t, gp_scf, wp_bbl, pvt, pi, bgi,
-                              bw, two_phase)
-    # Replay the influx history at the fitted parameters.
-    we_hist, we = np.zeros(len(t)), 0.0
-    for i in range(1, len(t)):
-        dt = max(float(t[i] - t[i - 1]), 0.0)
-        decay = 1.0 - math.exp(-dt / tb) if tb > 0 else 1.0
-        p_avg = 0.5 * (p_pred[i - 1] + p_pred[i])
-        we = max(we + (wb / pi) * (pi * (1.0 - we / wb) - p_avg) * decay, 0.0)
-        we_hist[i] = we
+    p_pred = march(gb, ab, bb, t, gp_scf, wp_bbl, pvt, pi, bgi, bw, two_phase)
+    # Recover the influx from the material balance itself rather than replaying
+    # each model's recursion: We = G*Bgi + Wp*Bw - Bg*(G - Gp) is exact, holds
+    # for any influx law, and cannot drift from the pressures just predicted.
+    z_pred = np.asarray(zf(p_pred), dtype=float)
+    bg_pred = 0.0050346 * z_pred * pvt.T_R / p_pred
+    we_hist = np.maximum(gb * bgi + wp_bbl * bw - bg_pred * (gb - gp_scf), 0.0)
+    we_hist[0] = 0.0
 
     # -- the locus -------------------------------------------------------
     # Profile along G: for each candidate gas in place, re-optimise the aquifer
     # and record the best fit it can manage. That traces the actual valley in
     # the objective, which a coarse grid cannot - and the valley, not the single
-    # best triplet, is the honest answer. A big aquifer with a small J and a
-    # small one with a big J bend the same pressure history; only late aquifer
-    # depletion tells them apart, and a finite record rarely reaches it.
+    # best triplet, is the honest answer.
     best_rms = float(best[0])
-    thresh = max(best_rms * locus_tolerance, best_rms + 0.05)
+    # The profile's own best G must be in the grid, and the profile's fit AT
+    # that G cannot be worse than the global refine already achieved there.
+    # Without both, a very tight fit produces a locus that excludes its own
+    # best answer - which is not a wide solution, it is an inconsistent one.
+    g_prof = np.unique(np.concatenate([
+        np.geomspace(max(g_lo, 0.55 * gb), 2.2 * gb, 13), [gb]]))
     prof = []
-    for gv in np.geomspace(max(g_lo, 0.55 * gb), 2.2 * gb, 13):
+    for gv in g_prof:
         def obj_g(x, _g=gv):
             return rms(_g, math.exp(x[0]), math.exp(x[1]))
         try:
-            sol = optimize.minimize(obj_g, np.log([wb, tb]), method="Nelder-Mead",
-                                    options=dict(maxiter=160, xatol=1e-2,
-                                                 fatol=1e-3))
-            e, wv, tv = float(sol.fun), math.exp(sol.x[0]), math.exp(sol.x[1])
+            sol = optimize.minimize(obj_g, np.log([ab, bb]),
+                                    method="Nelder-Mead",
+                                    options=dict(maxiter=300, xatol=1e-3,
+                                                 fatol=1e-4))
+            e, av, bv = float(sol.fun), math.exp(sol.x[0]), math.exp(sol.x[1])
         except Exception:
             continue
+        if abs(gv / gb - 1.0) < 1e-9 and e > best_rms:
+            e, av, bv = best_rms, ab, bb
         if np.isfinite(e):
-            prof.append((gv / 1.0e6, wv / 1.0e6, tv, wv / (pi * tv), e))
+            prof.append((gv / 1.0e6, av, bv, e))
 
-    loc = pd.DataFrame(prof, columns=["G_mmscf", "Wei_mmbbl", "tau_days",
-                                      "J_bbl_d_psi", "rms_pct"])
+    loc = pd.DataFrame(prof, columns=["G_mmscf", a_name, b_name, "rms_pct"])
+    # Thresholding off the profile's own minimum keeps the band self-consistent
+    # even where the profile cannot quite reach the global optimum.
+    if len(loc):
+        best_rms = min(best_rms, float(loc["rms_pct"].min()))
+    thresh = max(best_rms * locus_tolerance, best_rms + 0.05)
     inside = loc[loc["rms_pct"] <= thresh] if len(loc) else loc
     # Interpolate where the profile actually crosses the threshold rather than
     # quantising the range to whichever G values happened to be sampled - with
-    # a tight fit that otherwise collapses to a single point and reports a
-    # range of zero width.
+    # a tight fit that otherwise collapses to a single point.
     g_range = (gb / 1.0e6, gb / 1.0e6)
     if len(loc) >= 2:
         gx = loc["G_mmscf"].to_numpy()
@@ -3407,11 +3955,15 @@ def fetkovich_aquifer_fit(t_days: np.ndarray,
     hcpv_res_bbl = gb * bgi
     we_frac = float(we_hist[-1] / hcpv_res_bbl) if hcpv_res_bbl > 0 else np.nan
 
-    return {
+    # An effective productivity index, defined the same way for both models so
+    # they can be put side by side: total influx over the integrated drawdown.
+    draw = float(np.trapezoid(np.maximum(pi - p_pred, 0.0), t)) \
+        if hasattr(np, "trapezoid") else float(np.trapz(np.maximum(pi - p_pred, 0.0), t))
+    j_eff = float(we_hist[-1] / draw) if draw > 0 else float("nan")
+
+    out = {
+        "model": model,
         "G_mmscf": gb / 1.0e6,
-        "Wei_mmbbl": wb / 1.0e6,
-        "tau_days": tb,
-        "J_bbl_d_psi": wb / (pi * tb),
         "We_mmbbl": we_hist[-1] / 1.0e6,
         "rms_pct": float(best[0]),
         "p_initial": pi,
@@ -3425,7 +3977,47 @@ def fetkovich_aquifer_fit(t_days: np.ndarray,
         "rms_threshold": thresh,
         "we_frac_hcpv": we_frac,
         "g_range_mmscf": g_range,
+        "J_eff_bbl_d_psi": j_eff,
     }
+    if model == "fetkovich":
+        out.update({
+            "Wei_mmbbl": ab / 1.0e6,
+            "tau_days": bb,
+            "J_bbl_d_psi": ab / (pi * bb),
+            "params": {"Wei (MMbbl)": ab / 1.0e6, "tau (days)": bb,
+                       "J (bbl/d/psi)": ab / (pi * bb)},
+        })
+    else:
+        # B'*p_i is the aquifer's expansion capacity in barrels, the same
+        # quantity Fetkovich calls Wei, so the two models stay comparable.
+        td_end = float((t[-1] - t[0]) * bb)
+        out.update({
+            "Bprime_bbl_psi": ab,
+            "td_scale_per_day": bb,
+            "Wei_mmbbl": ab * pi / 1.0e6,
+            "td_at_end": td_end,
+            "transient": bool(td_end < 100.0),
+            "J_bbl_d_psi": j_eff,
+            "params": {"B' (bbl/psi)": ab, "t_D scale (1/day)": bb,
+                       "t_D at end of record": td_end,
+                       "Wei equivalent (MMbbl)": ab * pi / 1.0e6},
+        })
+    return out
+
+
+def fetkovich_aquifer_fit(*args, **kwargs) -> Optional[Dict]:
+    """`aquifer_fit` with model='fetkovich'. Kept for callers that predate it."""
+    kwargs.pop("model", None)
+    for old, new in (("wei_grid", "a_grid"), ("tau_grid", "b_grid")):
+        if old in kwargs:
+            kwargs[new] = kwargs.pop(old)
+    return aquifer_fit(*args, model="fetkovich", **kwargs)
+
+
+def carter_tracy_aquifer_fit(*args, **kwargs) -> Optional[Dict]:
+    """`aquifer_fit` with model='carter_tracy'."""
+    kwargs.pop("model", None)
+    return aquifer_fit(*args, model="carter_tracy", **kwargs)
 
 
 def flowing_material_balance(t_days: np.ndarray,
@@ -3436,7 +4028,9 @@ def flowing_material_balance(t_days: np.ndarray,
                              p_init: Optional[float] = None,
                              g_max_multiple: float = 30.0,
                              n_grid: int = 60,
-                             min_r2: float = 0.60) -> Dict[str, float]:
+                             min_r2: float = 0.60,
+                             two_phase_pseudo_pressure: bool = True
+                             ) -> Dict[str, float]:
     """Contacted gas in place from flowing data alone (Mattar-style FMB).
 
     Under boundary-dominated flow at (near) constant flowing pressure,
@@ -3448,13 +4042,20 @@ def flowing_material_balance(t_days: np.ndarray,
     G -> x-intercept(G). That fixed point is found by bracketing and bisection
     rather than by damped substitution, which oscillates.
 
-    **Read the answer with care on a condensate well.** Below the dew point the
-    condensate bank steadily degrades near-wellbore mobility, so the normalised
-    rate falls faster than depletion alone would explain, the line is too steep
-    and the x-intercept lands *below* the true gas in place. FMB here estimates
-    effective, currently-contacted gas under the prevailing skin - a useful
-    lower bound and a good cross-check on the decline, not a replacement for a
-    two-phase p/z material balance. `bias_warning` in the result flags this.
+    **The condensate bank.** Below the dew point retrograde liquid drops out
+    around the wellbore and takes relative permeability from the gas, so the
+    normalised rate falls faster than depletion alone explains, the line is too
+    steep and the x-intercept lands BELOW the true gas in place. With a CVD
+    liquid-dropout column and a relative permeability defined on the PVT, the
+    Fevang-Whitson two-phase pseudo-pressure m*(p) is used instead of m(p),
+    which puts that loss in the mobility where it belongs rather than in the
+    volume. `pseudo_pressure` in the result says which was used, and
+    `bank_correction` how much it moved the answer.
+
+    Without those inputs it falls back to the single-phase m(p) and the old
+    caveat stands: the answer is effective, currently-contacted gas under the
+    prevailing skin - a lower bound, not a replacement for a two-phase p/z
+    material balance.
     """
     t = np.asarray(t_days, float)
     q = np.asarray(q_ws, float)
@@ -3468,7 +4069,11 @@ def flowing_material_balance(t_days: np.ndarray,
 
     pi = float(p_init if p_init is not None else (pvt.p_init or pwf.max() * 1.3))
     pz_i = pi / float(pvt.z_two_phase(np.array([pi]))[0])
-    m_wf = pvt.m(pwf)
+    use_2p = bool(two_phase_pseudo_pressure and pvt.relperm is not None
+                  and pvt.cvd is not None
+                  and pvt.cvd.liquid_dropout is not None)
+    mfun = pvt.m_two_phase if use_2p else pvt.m
+    m_wf = mfun(pwf)
     g_lo = max(1.02 * float(g[-1]), 1.0)
     g_hi = g_max_multiple * max(float(g[-1]), 1.0)
 
@@ -3481,7 +4086,7 @@ def flowing_material_balance(t_days: np.ndarray,
         # straight but entirely meaningless line. Reject those outright.
         if np.min(p_avg) <= np.max(pwf) + 100.0:
             return np.nan, None
-        dm = pvt.m(p_avg) - m_wf
+        dm = mfun(p_avg) - m_wf
         valid = dm > 0
         if valid.sum() < 4:
             return np.nan, None
@@ -3524,6 +4129,23 @@ def flowing_material_balance(t_days: np.ndarray,
         np.array(pz_i * (1.0 - np.clip(g / G_star, 0.0, 0.999))))
     below_dew = bool(pvt.p_dew and np.nanmin(p_avg) < pvt.p_dew)
 
+    # How much the bank correction moved the answer. Re-running single-phase is
+    # cheap next to the fixed-point search that has already happened, and the
+    # difference is the whole point of doing it: it is the deliverability the
+    # bank was costing, expressed as the gas the old method never saw.
+    single_g = float("nan")
+    single_r2 = float("nan")
+    if use_2p:
+        try:
+            single = flowing_material_balance(
+                t, q, g, pwf, pvt, p_init=pi, g_max_multiple=g_max_multiple,
+                n_grid=n_grid, min_r2=min_r2,
+                two_phase_pseudo_pressure=False)
+            single_g = float(single["ogip_contacted_mmscf"])
+            single_r2 = float(single["r2"])
+        except Exception:
+            pass
+
     return {
         "ogip_contacted_mmscf": float(G_star),
         "converged": bool(converged),
@@ -3531,7 +4153,25 @@ def flowing_material_balance(t_days: np.ndarray,
         "b_pss": (float(1.0 / res.intercept)
                   if res is not None and res.intercept else float("nan")),
         "p_avg_last_psia": float(p_avg[-1]),
-        "bias_warning": float(below_dew),
+        "bias_warning": float(below_dew and not use_2p),
+        "pseudo_pressure": "two-phase (Fevang-Whitson)" if use_2p
+                           else "single-phase",
+        "ogip_single_phase_mmscf": single_g,
+        "bank_correction": (float(G_star / single_g - 1.0)
+                            if np.isfinite(single_g) and single_g > 0
+                            else float("nan")),
+        "bank_mobility_loss_last": (float(pvt.bank_mobility_loss(
+            np.array([p_avg[-1]]))[0]) if use_2p else float("nan")),
+        # How much the mobility loss VARIES across the fitted window. This is
+        # the number that decides whether the correction can move the answer at
+        # all: the x-intercept of q/dm against Gp is unchanged by multiplying
+        # dm by a constant, so a mobility loss that is large but uniform
+        # straightens the line without shifting G. Only a loss that changes
+        # across the window moves the intercept.
+        "bank_loss_spread": (
+            float(np.ptp(pvt.bank_mobility_loss(p_avg))) if use_2p
+            else float("nan")),
+        "r2_single_phase": single_r2,
     }
 
 
@@ -3561,6 +4201,73 @@ class ProductSplit:
 
 
 @dataclass
+class WaterTrend:
+    """A log-linear trend fitted to produced water, used to forecast it.
+
+    Water on a gas well is not an Arps problem. It does not decline, it climbs,
+    and what ends the well is usually the handling limit rather than the gas
+    rate. A straight line through log(q_w) is crude, but it is the trend the
+    data actually support and it is transparent about it: r2 and p_value are
+    reported so a weak trend can be disbelieved.
+    """
+    q0_stbd: float                  # fitted rate at t0
+    slope_per_day: float            # d ln(q_w) / dt
+    t0_days: float
+    r2: float
+    p_value: float
+    n_points: int
+    q_last_stbd: float = float("nan")
+    t_last_days: float = float("nan")
+
+    @property
+    def growth_pct_per_year(self) -> float:
+        return 100.0 * (math.exp(self.slope_per_day * DAYS_PER_YEAR) - 1.0)
+
+    @property
+    def significant(self) -> bool:
+        """A trend worth forecasting on, rather than scatter with a slope."""
+        return bool(self.n_points >= 8 and np.isfinite(self.p_value)
+                    and self.p_value < 0.05 and self.r2 >= 0.15)
+
+    def rate(self, t_days) -> np.ndarray:
+        t = np.asarray(t_days, dtype=float)
+        return self.q0_stbd * np.exp(self.slope_per_day * (t - self.t0_days))
+
+    def time_to(self, q_target: float) -> float:
+        """Days from first production until the trend reaches `q_target`."""
+        if self.q0_stbd <= 0 or q_target <= 0 or self.slope_per_day == 0:
+            return float("nan")
+        return self.t0_days + math.log(q_target / self.q0_stbd) / self.slope_per_day
+
+    def summary(self) -> str:
+        return (f"  water trend       : {self.growth_pct_per_year:+,.0f} %/yr "
+                f"(R2 {self.r2:.2f}, p {self.p_value:.1e}, "
+                f"n={self.n_points}), last {self.q_last_stbd:,.0f} STB/d"
+                + ("" if self.significant else "  [NOT significant]"))
+
+
+def fit_water_trend(t_days: np.ndarray, q_water: np.ndarray,
+                    min_points: int = 6) -> Optional[WaterTrend]:
+    """Fit log(q_water) against time. Returns None when there is nothing to fit."""
+    t = np.asarray(t_days, dtype=float)
+    q = np.asarray(q_water, dtype=float)
+    ok = np.isfinite(t) & np.isfinite(q) & (q > 0)
+    if int(ok.sum()) < min_points:
+        return None
+    t, q = t[ok], q[ok]
+    res = stats.linregress(t, np.log(q))
+    if not np.isfinite(res.slope):
+        return None
+    t0 = float(t[0])
+    return WaterTrend(
+        q0_stbd=float(math.exp(res.intercept + res.slope * t0)),
+        slope_per_day=float(res.slope), t0_days=t0,
+        r2=float(res.rvalue ** 2), p_value=float(res.pvalue),
+        n_points=int(len(t)), q_last_stbd=float(q[-1]),
+        t_last_days=float(t[-1]))
+
+
+@dataclass
 class Forecast:
     """A production forecast with products and cumulative volumes."""
     table: pd.DataFrame
@@ -3573,6 +4280,13 @@ class Forecast:
     remaining_sales_gas_mmscf: float
     remaining_condensate_mstb: float
     remaining_ngl_mstb: float
+    # Which constraint actually ended the forecast, and when each one would
+    # have. A 40-year life quoted off the gas rate on a well that drowns in
+    # three is not a forecast, it is an arithmetic exercise.
+    abandonment_reason: str = "gas rate"
+    constraint_years: Dict[str, float] = field(default_factory=dict)
+    water_trend: Optional[WaterTrend] = None
+    q_water_last_stbd: float = float("nan")
 
     def summary(self) -> str:
         return "\n".join([
@@ -3588,6 +4302,11 @@ class Forecast:
             f"    sales gas        : {self.remaining_sales_gas_mmscf:,.0f} MMscf",
             f"    condensate       : {self.remaining_condensate_mstb:,.0f} Mstb",
             f"    plant NGL        : {self.remaining_ngl_mstb:,.0f} Mstb",
+            f"  ended by           : {self.abandonment_reason}"
+            + ("" if not self.constraint_years else
+               "\n" + "\n".join(
+                   f"    {k:<16} {v:,.1f} yr" for k, v in
+                   sorted(self.constraint_years.items(), key=lambda kv: kv[1]))),
         ])
 
 
@@ -3602,7 +4321,10 @@ def forecast_products(fit: FitResult,
                       t_max_years: float = 40.0,
                       step_days: float = 30.4375,
                       products: Optional[ProductSplit] = None,
-                      ogip_cap_mmscf: Optional[float] = None) -> Forecast:
+                      ogip_cap_mmscf: Optional[float] = None,
+                      water_trend: Optional[WaterTrend] = None,
+                      q_water_econ_stbd: Optional[float] = None,
+                      water_cut_econ: Optional[float] = None) -> Forecast:
     """Roll the decline forward, apply the yield model, and split into products.
 
     The gas forecast comes from the wellstream decline; condensate comes from
@@ -3634,14 +4356,56 @@ def forecast_products(fit: FitResult,
     cum_at_start = float(model.cum(np.array([t_start_days]))[0])
     gp = gp_to_date_mmscf + (cum_model - cum_at_start)
 
+    # -- constraints -------------------------------------------------------
+    # The gas economic limit set the array above. Everything else that can end
+    # the well is applied here and the EARLIEST one wins. Each is recorded even
+    # when it does not bind, because knowing a well drowns in three years and
+    # dies on rate in thirteen is the whole point of looking.
+    reason = "gas rate"
+    constraint_years: Dict[str, float] = {"gas rate": t_ab / DAYS_PER_YEAR}
+    cut_at = len(t)
+
     if ogip_cap_mmscf is not None and np.isfinite(ogip_cap_mmscf):
-        over = gp > ogip_cap_mmscf
-        if np.any(over):
-            keep = ~over
-            if keep.sum() < 2:
-                keep[:2] = True
-            t, q_ws, gp = t[keep], q_ws[keep], gp[keep]
-            t_ab = float(t[-1])
+        over = np.flatnonzero(gp > ogip_cap_mmscf)
+        if over.size:
+            constraint_years["gas in place"] = float(
+                t[max(int(over[0]) - 1, 0)] / DAYS_PER_YEAR)
+            if int(over[0]) < cut_at:
+                cut_at, reason = int(over[0]), "gas in place"
+
+    q_water = (water_trend.rate(t) if water_trend is not None
+               else np.full(len(t), np.nan))
+    if water_trend is not None:
+        cgr_probe = yield_model(gp)
+        q_cond_probe = q_ws / MSCF_PER_MMSCF * cgr_probe
+        liq = q_water + q_cond_probe
+        with np.errstate(divide="ignore", invalid="ignore"):
+            wcut = np.where(liq > 0, q_water / liq, 0.0)
+        for label, series, limit in (
+                ("water rate", q_water, q_water_econ_stbd),
+                ("water cut", wcut, water_cut_econ)):
+            if limit is None or not np.isfinite(limit) or limit <= 0:
+                continue
+            hit = np.flatnonzero(series > limit)
+            if hit.size:
+                constraint_years[label] = float(
+                    t[max(int(hit[0]) - 1, 0)] / DAYS_PER_YEAR)
+                if int(hit[0]) < cut_at:
+                    cut_at, reason = int(hit[0]), label
+            elif label == "water rate":
+                # Report when it WOULD bind even beyond the forecast, so the
+                # margin is visible rather than merely absent.
+                tw = water_trend.time_to(float(limit))
+                if np.isfinite(tw) and tw > 0:
+                    constraint_years[label] = float(tw / DAYS_PER_YEAR)
+
+    if cut_at < len(t):
+        keep = max(cut_at, 2)
+        t, q_ws, gp = t[:keep], q_ws[:keep], gp[:keep]
+        q_water = q_water[:keep]
+        t_ab = float(t[-1])
+    if t_ab >= t_max - 1e-9 and reason == "gas rate":
+        reason = "max forecast life"
 
     cgr = yield_model(gp)                          # STB/MMscf
     q_cond = q_ws / MSCF_PER_MMSCF * cgr           # STB/d
@@ -3667,6 +4431,7 @@ def forecast_products(fit: FitResult,
         "Np_condensate_mstb": np_to_date_mstb + cum_cond,
         "cum_sales_gas_mmscf": cum_sales,
         "cum_ngl_mstb": cum_ngl,
+        "q_water_stbd": q_water,
     })
 
     # Apply the same processing split to the historical separator gas so the
@@ -3689,6 +4454,11 @@ def forecast_products(fit: FitResult,
         remaining_sales_gas_mmscf=float(cum_sales[-1]),
         remaining_condensate_mstb=float(cum_cond[-1]),
         remaining_ngl_mstb=float(cum_ngl[-1]),
+        abandonment_reason=reason,
+        constraint_years=constraint_years,
+        water_trend=water_trend,
+        q_water_last_stbd=(float(q_water[-1]) if len(q_water)
+                           and np.isfinite(q_water[-1]) else float("nan")),
     )
 
 
@@ -3865,6 +4635,9 @@ class WellResult:
     matbal: Optional[MaterialBalanceResult] = None
     fmb: Optional[Dict[str, float]] = None
     ogip_choice: Optional[OGIPChoice] = None
+    liquid_check: Optional[LiquidCheck] = None
+    water_in_liquid: Optional[WaterInLiquid] = None
+    bank: Optional[BankDiagnostic] = None
     settings: Dict = field(default_factory=dict)
 
     def summary(self, stream=None) -> str:
@@ -3921,6 +4694,14 @@ class WellResult:
                 body += "  cap applied       : none\n"
             body += f"  why               : {oc.reason}"
             out += ["-- Gas in place used for the cap " + "-" * 45, body, ""]
+        diag = [d.summary() for d in (self.liquid_check, self.water_in_liquid,
+                                      self.bank) if d is not None]
+        if diag:
+            out += ["-- Liquid stream and bank " + "-" * 52,
+                    "\n".join(diag), ""]
+        if self.forecast.water_trend is not None:
+            out += ["-- Produced water " + "-" * 60,
+                    self.forecast.water_trend.summary(), ""]
         out += ["-- Deterministic forecast " + "-" * 52, self.forecast.summary(), ""]
         if self.mc_stats:
             out.append("-- Probabilistic EUR (P90 = low case) " + "-" * 40)
@@ -3978,6 +4759,9 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                  use_fmb: bool = False,
                  apply_ogip_cap: bool = True,
                  ogip_cap_mode: str = "auto",
+                 aquifer_model: str = "fetkovich",
+                 q_water_econ_stbd: Optional[float] = None,
+                 water_cut_econ: Optional[float] = None,
                  prepare_kwargs: Optional[Dict] = None,
                  verbose: bool = True) -> WellResult:
     """Run the full gas condensate DCA workflow on one well.
@@ -4082,13 +4866,14 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                   if matbal.n_skipped else "."))
                 if use_aquifer and len(surv) >= 4:
                     try:
-                        matbal.fetkovich = fetkovich_aquifer_fit(
+                        matbal.fetkovich = aquifer_fit(
                             surv["t"].to_numpy(float)[mb_skip_early:],
                             surv["p_res"].to_numpy(float)[mb_skip_early:],
                             surv["Gp_ws"].to_numpy(float)[mb_skip_early:],
                             pvt, matbal.p_initial,
                             water_mstb=(surv[wcol].to_numpy(float)[mb_skip_early:]
-                                        if wcol else None))
+                                        if wcol else None),
+                            model=aquifer_model)
                     except Exception as exc:
                         warnings.warn(f"[{well}] aquifer fit failed: {exc}")
             except Exception as exc:
@@ -4117,6 +4902,25 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                     else ogip_cap_mode))
     ogip_cap = ogip_choice.value if np.isfinite(ogip_choice.value) else None
 
+    # -- water, liquid-stream and bank diagnostics -------------------------
+    water = None
+    if "q_water" in data.df.columns:
+        water = fit_water_trend(data.t,
+                                pd.to_numeric(data.df["q_water"],
+                                              errors="coerce").to_numpy(float))
+    liquid_check = check_liquid_stream(data.cgr, pvt.initial_cgr,
+                                       dates=data.df.get("date"))
+    water_in_liquid = diagnose_water_in_liquid(
+        data.cgr,
+        (pd.to_numeric(data.df["q_water"], errors="coerce").to_numpy(float)
+         if "q_water" in data.df.columns else np.full(len(data.cgr), np.nan)),
+        data.q_cond)
+    bank = bank_diagnostic(
+        data.t, data.q_ws, data.Gp_ws, data.p_wf, pvt,
+        ogip_choice.value if np.isfinite(ogip_choice.value) else None,
+        matbal.p_initial if matbal is not None else pvt.p_init,
+        t_min=t_lo)
+
     # -- forecast ---------------------------------------------------------
     t_last = float(data.t[-1])
     fc = forecast_products(best, yield_model, pvt, q_econ_mscfd,
@@ -4126,7 +4930,11 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                            t_start_days=t_last,
                            t_max_years=t_max_years,
                            products=products,
-                           ogip_cap_mmscf=ogip_cap)
+                           ogip_cap_mmscf=ogip_cap,
+                           water_trend=(water if water is not None
+                                        and water.significant else None),
+                           q_water_econ_stbd=q_water_econ_stbd,
+                           water_cut_econ=water_cut_econ)
 
     # -- uncertainty ------------------------------------------------------
     mc = mc_stats = None
@@ -4157,7 +4965,8 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     res = WellResult(well=well, data=data, pvt=pvt, model_table=table, fits=fits,
                      best_fit=best, yield_model=yield_model, forecast=fc,
                      mc=mc, mc_stats=mc_stats, matbal=matbal, fmb=fmb,
-                     ogip_choice=ogip_choice,
+                     ogip_choice=ogip_choice, liquid_check=liquid_check,
+                     water_in_liquid=water_in_liquid, bank=bank,
                      settings={"q_econ_mscfd": q_econ_mscfd,
                                "fit_window_days": (t_lo, t_hi),
                                "selected_model": key,
@@ -4166,6 +4975,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                "ogip_cap_reason": ogip_choice.reason,
                                "ogip_cap_rel_sigma": ogip_choice.rel_sigma,
                                "ogip_candidates": ogip_choice.candidates,
+                               "aquifer_model": aquifer_model,
                                "matbal_note": matbal_note,
                                "terminal_decline_pct_yr": terminal_decline_pct_yr})
     if verbose:
@@ -5072,6 +5882,198 @@ def run_self_tests(verbose: bool = True) -> bool:
     check("switching the cap off leaves the forecast uncapped",
           not np.isfinite(select_ogip(sup_cap, mode="none").value),
           "mode='none' returns no cap")
+
+    # 9d3 -- Carter-Tracy: the transient the pseudo-steady model cannot make
+    t_ct = np.linspace(0, 9 * 365.25, 12)
+    G_ct = 80_000e6
+    gp_ct = np.linspace(0, 0.42 * G_ct, 12) / 1e6
+    p_ct = _carter_tracy_march(G_ct, 2000.0, 0.02, t_ct, gp_ct * 1e6,
+                               np.zeros(12), pvt_cvd, pi_f, bgi_f, 1.0, True)
+    check("Carter-Tracy p_D matches the van Everdingen-Hurst solution",
+          abs(float(_pd_edwardson(np.array([1.0]))[0][0]) - 0.8019) < 0.005
+          and abs(float(_pd_edwardson(np.array([10.0]))[0][0]) - 1.6509) < 0.005,
+          f"p_D(1)={float(_pd_edwardson(np.array([1.0]))[0][0]):.4f}, "
+          f"p_D(10)={float(_pd_edwardson(np.array([10.0]))[0][0]):.4f}")
+    ct = aquifer_fit(t_ct, p_ct, gp_ct, pvt_cvd, pi_f, model="carter_tracy")
+    check("Carter-Tracy recovers a known transient aquifer",
+          ct is not None and abs(ct["G_mmscf"] / (G_ct / 1e6) - 1) < 0.03
+          and ct["rms_pct"] < 0.5,
+          f"G {ct['G_mmscf']:,.0f} vs {G_ct / 1e6:,.0f} MMscf, "
+          f"B' {ct['Bprime_bbl_psi']:,.0f} vs 2,000 bbl/psi, rms "
+          f"{ct['rms_pct']:.3f} %")
+    fk_on_ct = aquifer_fit(t_ct, p_ct, gp_ct, pvt_cvd, pi_f, model="fetkovich")
+    check("Fetkovich overstates G on a transient aquifer, as expected",
+          fk_on_ct is not None
+          and fk_on_ct["G_mmscf"] > ct["G_mmscf"] * 1.10,
+          f"Fetkovich {fk_on_ct['G_mmscf']:,.0f} vs Carter-Tracy "
+          f"{ct['G_mmscf']:,.0f} MMscf against a truth of {G_ct / 1e6:,.0f} "
+          f"- it inflates Wei to {fk_on_ct['Wei_mmbbl']:,.0f} MMbbl to make "
+          "the early influx a pseudo-steady law cannot produce")
+    check("the aquifer locus always contains its own best fit",
+          all(f["g_range_mmscf"][0] * 0.999 <= f["G_mmscf"]
+              <= f["g_range_mmscf"][1] * 1.001
+              for f in (ct, fk_on_ct, fk) if f is not None),
+          "checked for both models on both synthetic aquifers")
+    check("Carter-Tracy refuses to push the tank above initial pressure",
+          not np.all(np.isfinite(_carter_tracy_march(
+              G_ct, 6.0e5, 0.2, t_ct, gp_ct * 1e6, np.zeros(12), pvt_cvd,
+              pi_f, bgi_f, 1.0, True))),
+          "an unstable parameter set is rejected, not fitted")
+
+    # 9d4 -- Fevang-Whitson: the bank belongs in the mobility, not the volume
+    rp_t = RelPerm()
+    check("Corey k_rg falls as condensate drops out",
+          abs(float(rp_t.krg(0.0)) - rp_t.krg_max) < 1e-12
+          and float(rp_t.krg(0.4)) < 0.25 * rp_t.krg_max
+          and float(rp_t.kro(0.05)) == 0.0,
+          f"k_rg/max at S_o=0.4 is "
+          f"{float(rp_t.krg(0.4)) / rp_t.krg_max:.3f}; condensate immobile "
+          f"below S_org")
+    cvd_ld = CVDTable(
+        pressure=np.array([5100, 4500, 3800, 3100, 2400, 1800, 1200, 700.0]),
+        cum_produced_molfrac=np.array([0, .078, .176, .283, .402, .515, .641,
+                                       .757]),
+        liquid_dropout=np.array([0, .081, .134, .152, .146, .131, .108, .086]))
+    pvt_1p = PVT(gas_gravity=0.72, temperature_F=248, condensate_api=52.0,
+                 p_dew=5100.0, p_init=6400.0, y_n2=0.012, y_co2=0.031,
+                 cvd=cvd_ld, initial_cgr=78.0)
+    pvt_2p = PVT(gas_gravity=0.72, temperature_F=248, condensate_api=52.0,
+                 p_dew=5100.0, p_init=6400.0, y_n2=0.012, y_co2=0.031,
+                 cvd=cvd_ld, initial_cgr=78.0,
+                 relperm=RelPerm(bank_saturation_ratio=2.5))
+    p_bank = np.array([5200.0, 4000.0, 3000.0, 2000.0])
+    check("no relative permeability means m*(p) is exactly m(p)",
+          bool(np.allclose(pvt_1p.m_two_phase(p_bank), pvt_1p.m(p_bank))),
+          "the two-phase path is inert until it is switched on")
+    loss = pvt_2p.bank_mobility_loss(p_bank)
+    check("the bank costs no mobility above the dew point and plenty below",
+          abs(float(loss[0])) < 1e-9 and float(np.max(loss)) > 0.25,
+          f"loss {100 * float(loss[0]):.0f} % at 5,200 psia, "
+          f"{100 * float(np.max(loss)):.0f} % at its worst below")
+    df_b = make_synthetic_well(pvt_2p, ogip_mmscf=52000.0,
+                               q_plateau_mscfd=32000.0,
+                               plateau_target_frac=0.45, n_months=104, seed=77)
+    d_b = ProductionData.prepare(df_b, pvt_2p, well="BANK")
+    mb_w = d_b.t >= (d_b.qc.fit_start_days or d_b.t[0])
+    fmb2 = flowing_material_balance(d_b.t[mb_w], d_b.q_ws[mb_w],
+                                    d_b.Gp_ws[mb_w], d_b.p_wf[mb_w], pvt_2p,
+                                    p_init=6400.0)
+    check("the two-phase pseudo-pressure straightens the FMB line",
+          fmb2["r2"] > fmb2["r2_single_phase"],
+          f"R2 {fmb2['r2_single_phase']:.4f} -> {fmb2['r2']:.4f} with "
+          f"{100 * fmb2['bank_mobility_loss_last']:.0f} % mobility lost")
+    check("a near-uniform mobility loss cannot move the FMB intercept",
+          fmb2["bank_loss_spread"] < 0.10
+          and abs(fmb2["bank_correction"]) < 0.02,
+          f"loss varies by only {100 * fmb2['bank_loss_spread']:.0f} points "
+          f"across the window, so G moves "
+          f"{100 * fmb2['bank_correction']:+.1f} % - multiplying dm by a "
+          "constant leaves the x-intercept exactly where it was")
+
+    # 9d5 -- water ends wet gas wells, not the gas rate
+    t_w = np.arange(0, 12 * 365.25, 30.4375)
+    q_w_true = 40.0 * np.exp(math.log(1.5) / DAYS_PER_YEAR * t_w)   # +50 %/yr
+    rng_w = np.random.default_rng(3)
+    wt = fit_water_trend(t_w, q_w_true * rng_w.lognormal(0, 0.15, t_w.size))
+    check("a water trend is recovered from a noisy history",
+          wt is not None and abs(wt.growth_pct_per_year - 50.0) < 5.0
+          and wt.significant,
+          f"{wt.growth_pct_per_year:+,.1f} %/yr vs +50 (R2 {wt.r2:.2f}, "
+          f"p {wt.p_value:.1e})")
+    flat = fit_water_trend(t_w, np.full(t_w.size, 30.0)
+                           * rng_w.lognormal(0, 0.4, t_w.size))
+    check("a water history with no trend is not forecast on",
+          flat is None or not flat.significant,
+          "scatter with a slope is refused as a forecast basis")
+
+    ym_w = YieldModel(cgr_i=78.0, cgr_min=25.0, k=6.0e-5)
+    fr_w = fit_decline(t, q, "modified_hyperbolic", t0=0.0,
+                       fixed={"Dmin": truth.Dmin})
+    f_gas = forecast_products(fr_w, ym_w, pvt_cvd, 300.0)
+    f_wet = forecast_products(fr_w, ym_w, pvt_cvd, 300.0, water_trend=wt,
+                              q_water_econ_stbd=3000.0)
+    check("a water limit ends the well before the gas rate does",
+          f_wet.abandonment_reason == "water rate"
+          and f_wet.economic_life_years < f_gas.economic_life_years
+          and f_wet.eur_wellstream_mmscf < f_gas.eur_wellstream_mmscf,
+          f"{f_wet.economic_life_years:,.1f} yr on water vs "
+          f"{f_gas.economic_life_years:,.1f} yr on gas rate; EUR "
+          f"{f_wet.eur_wellstream_mmscf:,.0f} vs "
+          f"{f_gas.eur_wellstream_mmscf:,.0f} MMscf")
+    check("every constraint is reported, not only the binding one",
+          set(f_wet.constraint_years) >= {"gas rate", "water rate"}
+          and f_wet.constraint_years["gas rate"]
+          > f_wet.constraint_years["water rate"],
+          ", ".join(f"{k} {v:,.1f} yr"
+                    for k, v in sorted(f_wet.constraint_years.items(),
+                                       key=lambda kv: kv[1])))
+    check("a water limit that is never reached changes nothing",
+          forecast_products(fr_w, ym_w, pvt_cvd, 300.0, water_trend=wt,
+                            q_water_econ_stbd=1.0e9).abandonment_reason
+          == f_gas.abandonment_reason,
+          "an unreachable limit leaves the gas-rate answer alone")
+
+    # 9d6 -- the fluid sets a ceiling on the liquid it can produce
+    lean = check_liquid_stream(np.linspace(78.0, 30.0, 40), 78.0)
+    check("a leaning CGR passes the liquid check",
+          lean.ok and not lean.exceeds,
+          f"recent {lean.cgr_median_recent:,.0f} vs initial "
+          f"{lean.initial_cgr:,.0f} STB/MMscf")
+    rich = check_liquid_stream(np.linspace(100.0, 500.0, 40), 60.0)
+    check("a CGR above the initial value is caught and quantified",
+          rich.ok and rich.exceeds and rich.implied_non_condensate > 0.8,
+          f"{rich.ratio_recent:.1f}x initial, implies "
+          f"{100 * rich.implied_non_condensate:.0f} % of the liquid is not "
+          "condensate")
+    check("the liquid check declines to run without an initial CGR",
+          not check_liquid_stream(np.linspace(100.0, 500.0, 40), None).ok,
+          "no ceiling means no test")
+
+    # 9d7 -- is the extra liquid water?
+    n_d = 60
+    wcut_t = np.linspace(0.05, 0.75, n_d)
+    cgr_water = 60.0 / np.maximum(1.0 - wcut_t, 1e-6)      # pure water effect
+    dw = diagnose_water_in_liquid(cgr_water, wcut_t * 100.0,
+                                  (1 - wcut_t) * 100.0)
+    check("a CGR driven by water is identified as such",
+          dw.ok and dw.water_driven and dw.correlation > 0.9,
+          f"rho {dw.correlation:+.2f} (p {dw.p_value:.1e}), CGR at zero water "
+          f"cut {dw.clean_cgr:,.0f} STB/MMscf")
+    cgr_dep = np.linspace(78.0, 30.0, n_d)
+    dd = diagnose_water_in_liquid(cgr_dep, wcut_t * 100.0,
+                                  (1 - wcut_t) * 100.0)
+    check("a CGR falling with depletion is not blamed on water",
+          dd.ok and not dd.water_driven,
+          f"rho {dd.correlation:+.2f} - falling while water rises, which is "
+          "retrograde behaviour, not contamination")
+
+    # 9d8 -- the bank, measured as lost productivity index
+    df_pi = make_synthetic_well(pvt_cvd, ogip_mmscf=52000.0,
+                                q_plateau_mscfd=32000.0,
+                                plateau_target_frac=0.45, n_months=104,
+                                seed=77)
+    d_pi = ProductionData.prepare(df_pi, pvt_cvd, well="PI")
+    bd = bank_diagnostic(d_pi.t, d_pi.q_ws, d_pi.Gp_ws, d_pi.p_wf, pvt_cvd,
+                         52000.0, 6400.0,
+                         t_min=d_pi.qc.fit_start_days)
+    bd_all = bank_diagnostic(d_pi.t, d_pi.q_ws, d_pi.Gp_ws, d_pi.p_wf,
+                             pvt_cvd, 52000.0, 6400.0)
+    check("the productivity index falls on a condensate well",
+          bd.ok and bd.loss_frac > 0.05 and bd.trend_pct_per_year < 0,
+          f"PI fell {100 * bd.loss_frac:,.0f} % "
+          f"({bd.trend_pct_per_year:+,.0f} %/yr, R2 {bd.r2:.2f})")
+    check("including the plateau would have hidden the bank entirely",
+          bd_all.ok and bd_all.trend_pct_per_year > bd.trend_pct_per_year,
+          f"whole record {bd_all.trend_pct_per_year:+,.0f} %/yr vs "
+          f"{bd.trend_pct_per_year:+,.0f} %/yr after the plateau - on "
+          "plateau the choke holds the rate while drawdown shrinks, so the "
+          "index rises")
+    check("the bank diagnostic refuses to run without what it needs",
+          not bank_diagnostic(d_pi.t, d_pi.q_ws, d_pi.Gp_ws, None, pvt_cvd,
+                              52000.0, 6400.0).ok
+          and not bank_diagnostic(d_pi.t, d_pi.q_ws, d_pi.Gp_ws, d_pi.p_wf,
+                                  pvt_cvd, None, 6400.0).ok,
+          "no flowing pressure, or no gas in place to set p_avg")
 
     # 9d2 -- dates: ISO is accepted, ambiguity is refused rather than guessed
     iso = pd.Series(["2012-01-01", "2012-02-01", "2012-03-01", "2012-04-01"])
