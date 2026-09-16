@@ -697,7 +697,12 @@ with st.sidebar:
 
     with st.expander("CVD table (two-phase z)"):
         note("From the lab CVD report. Without it the Rayes correlation is "
-             "used, which is a regression rather than your fluid.")
+             "used, which is a regression rather than your fluid. The top row "
+             "is the <b>dew point</b>, where nothing has been produced yet, "
+             "and the table should reach below the lowest reservoir pressure "
+             "you expect. Lab reports usually quote both right-hand columns "
+             "as <b>percentages</b> — paste them either way, they are "
+             "converted if they exceed 1.")
         use_cvd = st.toggle("Use CVD table", value=True)
         cvd_df = st.data_editor(DEFAULT_CVD, num_rows="dynamic",
                                 key="cvd_editor",
@@ -794,6 +799,16 @@ try:
 except Exception as exc:
     st.error(f"The fluid definition is not valid: {exc}")
     st.stop()
+
+if pvt.cvd is not None and getattr(pvt.cvd, "unit_note", ""):
+    with st.sidebar:
+        note(f"<b>CVD units.</b> {pvt.cvd.unit_note[0].upper()}"
+             f"{pvt.cvd.unit_note[1:]}")
+
+if getattr(pvt, "cvd_warning", ""):
+    with st.sidebar:
+        warn(f"<b>CVD table.</b> {pvt.cvd_warning[0].upper()}"
+             f"{pvt.cvd_warning[1:]}")
 
 pvt_sig = (gas_gravity, temperature_F, condensate_api, mw_override, p_dew,
            p_init, Y_N2, Y_CO2, Y_H2S, initial_cgr, use_wellstream, cvd_key)
@@ -1269,8 +1284,21 @@ m[2].metric("EUR condensate",
             f"{res.forecast.eur_condensate_mstb:,.0f} Mstb",
             f"{res.forecast.remaining_condensate_mstb:,.0f} remaining")
 m[3].metric("Economic life", f"{res.forecast.economic_life_years:.1f} yr")
-m[4].metric("OGIP (material balance)",
-            f"{res.matbal.ogip_mmscf:,.0f} MMscf" if res.matbal else "n/a")
+# This tile used to read `matbal.ogip_mmscf` — the p/z intercept — whatever
+# the sidebar said, so selecting Fetkovich G changed nothing here and a record
+# with no intercept printed "nan MMscf". It now shows the gas in place actually
+# chosen, and names which one it is.
+_oc = res.ogip_choice
+if _oc is not None and np.isfinite(_oc.value):
+    m[4].metric("OGIP (material balance)", f"{_oc.value:,.0f} MMscf",
+                _oc.source, delta_color="off",
+                help="Follows **Which gas in place** in the sidebar. See the "
+                     "Material balance tab for every candidate and why this "
+                     "one was used.")
+else:
+    m[4].metric("OGIP (material balance)", "n/a", delta_color="off",
+                help=((_oc.reason if _oc is not None else "")
+                      or "No material balance on this well."))
 
 if fit.at_bounds:
     if fit.at_bounds == ["b"] and fit.params.get("b", 1.0) < 1e-6:
@@ -1409,6 +1437,13 @@ with tabs[3]:
                      "and should not be quoted. The ceiling and the aquifer "
                      "fit are the numbers to read here.")
 
+        if pvt.cvd is not None and len(mb.pressure):
+            _cov = pvt.cvd.coverage_note(float(np.min(mb.pressure)),
+                                         float(np.max(mb.pressure)))
+            if _cov:
+                warn(f"<b>The CVD table does not span these surveys.</b> "
+                     f"{_cov[0].upper()}{_cov[1:]}")
+
         if mb.pz_note:
             warn(f"<b>No straight-line OGIP.</b> {mb.pz_note[0].upper()}"
                  f"{mb.pz_note[1:]}<br>Everything else on this tab still "
@@ -1524,7 +1559,27 @@ with tabs[3]:
                 "Apparent G (MMscf)": "{:,.0f}"}), hide_index=True)
 
         fk = mb.fetkovich
-        if fk:
+        fk_bad = dca.fetkovich_health(fk) if fk else []
+        if fk and fk_bad:
+            st.markdown("#### Fetkovich aquifer fit")
+            warn("<b>This fit did not converge on anything meaningful, so the "
+                 "numbers below are not reported.</b><br>"
+                 + "<br>".join(f"· {b[0].upper()}{b[1:]}." for b in fk_bad)
+                 + "<br>An optimiser always returns a triplet. On data that "
+                 "cannot constrain it — a degenerate two-phase z, no initial "
+                 "pressure, or too few surveys far enough into depletion — it "
+                 "returns one that looks like every other answer this tab "
+                 "prints. Fix the input the checks above point at and the fit "
+                 "becomes readable; until then there is nothing here to use.")
+            with st.expander("Show the failed fit anyway"):
+                st.caption("For diagnosis only — do not quote these.")
+                b = st.columns(5)
+                b[0].metric("G", f"{fk['G_mmscf']:,.0f} MMscf")
+                b[1].metric("Wei", f"{fk['Wei_mmbbl']:,.0f} MMbbl")
+                b[2].metric("J", f"{fk['J_bbl_d_psi']:,.2f} bbl/d/psi")
+                b[3].metric("We to date", f"{fk['We_mmbbl']:,.1f} MMbbl")
+                b[4].metric("rms", f"{fk['rms_pct']:.2f} %")
+        elif fk:
             st.markdown("#### Fetkovich aquifer fit")
             a = st.columns(5)
             a[0].metric("G", f"{fk['G_mmscf']:,.0f} MMscf")
@@ -1543,12 +1598,18 @@ with tabs[3]:
                     "passing: this reservoir does not need an aquifer to "
                     f"explain its pressure history, and its independent G of "
                     f"{fk['G_mmscf']:,.0f} MMscf sits beside the p/z intercept "
-                    f"of {mb.ogip_mmscf:,.0f} MMscf.")
+                    + (f"of {mb.ogip_mmscf:,.0f} MMscf."
+                       if np.isfinite(mb.ogip_mmscf)
+                       else "— which this record does not have."))
             else:
                 st.info(
                     f"**Accounting for influx, G is {fk['G_mmscf']:,.0f} MMscf** "
-                    f"— against {mb.ogip_mmscf:,.0f} MMscf from the straight "
-                    "line, which assumed there was none. The model needs "
+                    + (f"— against {mb.ogip_mmscf:,.0f} MMscf from the "
+                       "straight line, which assumed there was none. "
+                       if np.isfinite(mb.ogip_mmscf) else
+                       "— the straight line gives no intercept on this "
+                       "record, so there is nothing to compare it with. ")
+                    + "The model needs "
                     f"{fk['We_mmbbl']:,.1f} MMbbl of water to have entered the "
                     f"reservoir — {wef:.0f}% of its hydrocarbon pore volume — "
                     "to hold the pressure up as observed.")

@@ -116,7 +116,13 @@ from scipy.interpolate import interp1d
 #   v2  dates fixed to ISO YYYY-MM-DD rather than guessed; the estimated-p_i
 #       row dated to the start of a month; a non-declining p/z diagnosed
 #       instead of aborting the material balance.
-__version__ = "2.0"
+#   v4  a CVD table quoted in percent - as lab reports are - is detected and
+#       converted rather than clipping every stage to 1 and flattening p/z.
+#   v3  a CVD table that does not span the survey pressures no longer flattens
+#       p/z in silence: it extrapolates instead of clamping, and the mismatch
+#       is reported. A Fetkovich fit that did not converge is refused rather
+#       than printed. The headline gas in place follows the cap selector.
+__version__ = "4.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -129,7 +135,7 @@ __all__ = [
     "material_balance_pz", "flowing_material_balance",
     "Forecast", "forecast_products", "monte_carlo_eur", "ProductSplit",
     "fetkovich_aquifer_fit", "havlena_odeh_gas", "gas_fvf_rb_per_scf",
-    "OGIPChoice", "select_ogip",
+    "OGIPChoice", "select_ogip", "fetkovich_health",
     "InitialPressureEstimate", "estimate_initial_pressure",
     "estimate_initial_pressure_from_wells", "field_survey_table",
     "parse_dates", "DateFormatError", "percentiles_petroleum",
@@ -378,6 +384,7 @@ class CVDTable:
     cum_produced_molfrac: np.ndarray
     z_gas: Optional[np.ndarray] = None
     liquid_dropout: Optional[np.ndarray] = None
+    unit_note: str = field(init=False, default="")
 
     def __post_init__(self):
         self.pressure = np.asarray(self.pressure, dtype=float)
@@ -392,6 +399,44 @@ class CVDTable:
         if self.liquid_dropout is not None:
             self.liquid_dropout = np.asarray(self.liquid_dropout, dtype=float)[order]
 
+        # Lab CVD reports quote both of these as PERCENT. Fed in unconverted,
+        # n_p clips to 0.999 at every stage, so p/z_2p = (p_dew/z_dew)(1 - n_p)
+        # collapses to a constant and z comes back in the hundreds. Nothing
+        # raises; the material balance simply returns nothing. A mole fraction
+        # cannot exceed 1, so a column that does is percent, and saying so is
+        # better than either guessing in silence or refusing a real report.
+        self.unit_note = ""
+        top = float(np.nanmax(self.cum_produced_molfrac))
+        if top > 100.0 + 1e-9:
+            raise ValueError(
+                f"CVD cum_produced_molfrac reaches {top:,.3g}; it is a "
+                "cumulative mole fraction, so it cannot exceed 1 (or 100 if "
+                "quoted as a percentage).")
+        if top > 1.0:
+            self.cum_produced_molfrac = self.cum_produced_molfrac / 100.0
+            self.unit_note = (
+                f"cum_produced_molfrac reached {top:,.2f}, so it was read as "
+                "a PERCENTAGE and divided by 100. A mole fraction cannot "
+                "exceed 1.")
+        if self.liquid_dropout is not None:
+            ld = float(np.nanmax(self.liquid_dropout))
+            if 1.0 < ld <= 100.0:
+                self.liquid_dropout = self.liquid_dropout / 100.0
+                self.unit_note += (
+                    f" liquid_dropout reached {ld:,.2f} and was read as a "
+                    "percentage too.")
+
+        n0 = float(self.cum_produced_molfrac[0])
+        if n0 > 0.02:
+            warnings.warn(
+                f"CVD: the highest-pressure stage has cum_produced_molfrac = "
+                f"{n0:.3f}, not 0. A CVD table starts at the dew point, where "
+                "nothing has been produced yet.")
+        if np.any(np.diff(self.cum_produced_molfrac) < -1e-9):
+            warnings.warn("CVD: cum_produced_molfrac falls as pressure drops; "
+                          "production is cumulative, so it can only rise. "
+                          "Check the column order.")
+
     def two_phase_z(self, p: np.ndarray, z_dew: float, p_dew: float) -> np.ndarray:
         """Two-phase z from CVD, defined so that p/z_2p is linear in moles produced.
 
@@ -401,11 +446,48 @@ class CVDTable:
         the definition that makes the p/z plot usable below the dew point.
         """
         p = np.asarray(p, dtype=float)
-        np_interp = np.interp(p, self.pressure[::-1],
-                              self.cum_produced_molfrac[::-1])
-        np_interp = np.clip(np_interp, 0.0, 0.999)
-        denom = (p_dew / z_dew) * (1.0 - np_interp)
+        # np.interp CLAMPS outside the table, and clamping here is not a small
+        # inaccuracy - it is fatal. n_p becomes a constant, so
+        # p/z_2p = (p_dew/z_dew)(1 - n_p) becomes a constant too: p/z goes flat
+        # against pressure, Bg goes flat, every Eg collapses to zero, and the
+        # whole material balance quietly returns nothing. A table that does not
+        # span the survey pressures produced exactly that - p/z spread of 0.0
+        # psia and R2 of 0.000 - with no error anywhere.
+        #
+        # Linear extrapolation of n_p is the honest continuation: below the last
+        # laboratory stage depletion carries on, so n_p keeps rising toward 1.
+        pr = self.pressure[::-1]
+        nr = self.cum_produced_molfrac[::-1]
+        np_i = np.interp(p, pr, nr)
+        if pr.size >= 2:
+            lo = p < pr[0]
+            if np.any(lo):
+                slope = (nr[1] - nr[0]) / (pr[1] - pr[0])
+                np_i = np.where(lo, nr[0] + slope * (p - pr[0]), np_i)
+            hi = p > pr[-1]
+            if np.any(hi):
+                slope = (nr[-1] - nr[-2]) / (pr[-1] - pr[-2])
+                np_i = np.where(hi, nr[-1] + slope * (p - pr[-1]), np_i)
+        np_i = np.clip(np_i, 0.0, 0.999)
+        denom = (p_dew / z_dew) * (1.0 - np_i)
         return np.where(denom > 0, p / denom, np.nan)
+
+    def covers(self, p_lo: float, p_hi: float, tol: float = 0.02) -> bool:
+        """Does the table span this pressure range, give or take `tol`?"""
+        return bool(float(self.pressure.min()) <= p_lo * (1.0 + tol)
+                    and float(self.pressure.max()) >= p_hi * (1.0 - tol))
+
+    def coverage_note(self, p_lo: float, p_hi: float) -> str:
+        """Empty when the table spans the data; otherwise what is wrong."""
+        if self.covers(p_lo, p_hi):
+            return ""
+        return (f"the CVD table runs {self.pressure.min():,.0f} - "
+                f"{self.pressure.max():,.0f} psia but the data run "
+                f"{p_lo:,.0f} - {p_hi:,.0f} psia. Outside the table the "
+                "produced mole fraction has to be extrapolated, and the "
+                "two-phase z is only as good as that extrapolation. Extend "
+                "the table to cover the reservoir pressures, or switch it off "
+                "and use the Rayes correlation.")
 
 
 def rayes_two_phase_z(p: np.ndarray, T_R: float, gas_gravity: float,
@@ -468,6 +550,7 @@ class PVT:
     effective_gravity: float = field(init=False)
     tpc: float = field(init=False)
     ppc: float = field(init=False)
+    cvd_warning: str = field(init=False, default="")
 
     def __post_init__(self):
         self.T_R = float(self.temperature_F) + 459.67
@@ -488,6 +571,23 @@ class PVT:
 
         self.tpc, self.ppc = sutton_pseudocriticals(
             self.effective_gravity, self.y_n2, self.y_co2, self.y_h2s)
+
+        # A CVD table starts AT the dew point, where nothing has been produced
+        # yet. If its top pressure sits well below the dew point the two are
+        # describing different fluids, and between the two values the model has
+        # no information at all - it returns a constant p/z, which silently
+        # empties the material balance rather than failing.
+        self.cvd_warning = ""
+        if self.cvd is not None and self.p_dew:
+            top = float(np.max(self.cvd.pressure))
+            if top < 0.90 * float(self.p_dew):
+                self.cvd_warning = (
+                    f"the CVD table starts at {top:,.0f} psia but the dew "
+                    f"point is {float(self.p_dew):,.0f} psia. A CVD table "
+                    "begins at the dew point by definition, so these are "
+                    "describing different fluids; between the two pressures "
+                    "the two-phase z is an extrapolation and p/z can go flat.")
+                warnings.warn(f"PVT: {self.cvd_warning}")
 
         self._build_tables()
 
@@ -2387,7 +2487,25 @@ def material_balance_pz(pressure: np.ndarray,
     # is unavailable, so only that is withheld.
     pz_trend_ok = bool(res.slope < 0)
     pz_note = ""
-    if not pz_trend_ok:
+    # Zero variance in p/z is not a reservoir observation, it is a broken
+    # two-phase z. It happens when the CVD table does not span the survey
+    # pressures: the produced mole fraction clamps or extrapolates to a
+    # constant, p/z goes flat, Bg goes flat and every Eg collapses to zero.
+    # Calling that "pressure support" would send the user looking for an
+    # aquifer that is not there.
+    pz_spread = float(np.ptp(pz))
+    if pz_spread <= 1e-6 * max(float(np.mean(pz)), 1.0):
+        pz_trend_ok = False
+        pz_note = (
+            f"p/z is exactly constant at {float(pz[0]):,.0f} psia across "
+            f"{float(g[-1] - g[0]):,.0f} MMscf of production, which no "
+            "reservoir does. The two-phase z is degenerate, not the data: "
+            "check that the CVD table spans the survey pressures "
+            f"({float(np.min(p)):,.0f} - {float(np.max(p)):,.0f} psia) and "
+            "that its top pressure is the dew point. Switching the CVD table "
+            "off falls back to the Rayes correlation, which is defined "
+            "everywhere.")
+    elif not pz_trend_ok:
         pz_note = (
             f"p/z does not decline with cumulative production: over "
             f"{float(g[-1] - g[0]):,.0f} MMscf the surveys move "
@@ -2959,9 +3077,8 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
                       and not matbal.impossible
                       and not matbal.ogip_exceeds_ceiling
                       and pz_usable)
-        fk_usable = bool(
-            fk and np.isfinite(fk_g) and fk_g > 0
-            and float(fk.get("rms_pct", 1e9)) < 5.0)
+        fk_usable = bool(fk and np.isfinite(fk_g) and fk_g > 0
+                         and not fetkovich_health(fk))
         if volumetric:
             pick, src, sig = pz, "p/z line", _sigma_pz()
             why = (f"F/Eg is flat ({matbal.ho_rise:.2f}x), so the tank is "
@@ -3019,6 +3136,44 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
                                  "capped.", candidates=cands)
     return OGIPChoice(value=float(pick), source=src, rel_sigma=float(sig),
                       reason=why, candidates=cands, clipped_to_ceiling=clipped)
+
+
+FETKOVICH_MAX_RMS_PCT = 5.0     # above this the pressure match is not a match
+FETKOVICH_MAX_WE_HCPV = 0.60    # influx larger than this much of HCPV is not credible
+
+
+def fetkovich_health(fk: Optional[Dict]) -> List[str]:
+    """Reasons a Fetkovich fit should not be read as an answer.
+
+    An optimiser always returns something. On data that cannot constrain it -
+    a degenerate two-phase z, no initial pressure, too few surveys - it returns
+    parameters at their bounds, an influx comparable to the whole pore volume,
+    and a pressure match that is not a match, while the report around it reads
+    exactly as it does for a good fit. These are the checks that tell the two
+    apart, kept in one place so the module and the app cannot disagree.
+    """
+    if not fk:
+        return []
+    bad: List[str] = []
+    rms = float(fk.get("rms_pct", float("nan")))
+    if not np.isfinite(rms) or rms > FETKOVICH_MAX_RMS_PCT:
+        bad.append(f"the pressure match is {rms:,.1f} % rms, which is not a "
+                   f"match - anything above {FETKOVICH_MAX_RMS_PCT:.0f} % "
+                   "means the model never reproduced the history it was fitted "
+                   "to")
+    wef = float(fk.get("we_frac_hcpv", float("nan")))
+    if np.isfinite(wef) and wef > FETKOVICH_MAX_WE_HCPV:
+        bad.append(f"it needs {100 * wef:,.0f} % of the hydrocarbon pore "
+                   "volume to have been replaced by water, which is not a "
+                   "reservoir, it is an optimiser running to its bounds")
+    g = float(fk.get("G_mmscf", float("nan")))
+    lo, hi = fk.get("g_range_mmscf", (float("nan"), float("nan")))
+    if np.isfinite(g) and np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+        if not (lo * 0.999 <= g <= hi * 1.001):
+            bad.append(f"the best-fit G of {g:,.0f} MMscf falls outside its "
+                       f"own locus of {lo:,.0f} - {hi:,.0f} MMscf, so the "
+                       "objective surface has no single valley to quote")
+    return bad
 
 
 def _fetkovich_march(g_scf: float, wei_bbl: float, tau_days: float,
@@ -4791,6 +4946,91 @@ def run_self_tests(verbose: bool = True) -> bool:
           and not np.isfinite(select_ogip(mb_loose, mode="p/z").value),
           f"OGIP {mb_loose.ogip_mmscf:,.0f} MMscf +/- {100 * rel_se:.0f} %, "
           f"cap = {select_ogip(mb_loose, mode='p/z').value}")
+
+    # 9c2b -- a CVD table quoted in percent is converted, not clipped to 1
+    cvd_pct = CVDTable(
+        pressure=np.array([4224, 3925, 3530, 3035, 2509, 1950, 1415, 1015,
+                           665, 375.0]),
+        cum_produced_molfrac=np.array([0, 4.87, 11.72, 22.66, 35.63, 49.72,
+                                       63.49, 74.99, 83.59, 89.92]),
+        liquid_dropout=np.array([0, 1.5, 3.507, 5.737, 7.18, 7.623, 7.127,
+                                 6.599, 5.936, 5.353]))
+    check("a CVD table entered in percent is detected and converted",
+          bool(cvd_pct.unit_note)
+          and abs(float(cvd_pct.cum_produced_molfrac.max()) - 0.8992) < 1e-9
+          and abs(float(np.max(cvd_pct.liquid_dropout)) - 0.07623) < 1e-9,
+          f"n_p max {float(cvd_pct.cum_produced_molfrac.max()):.4f}, "
+          f"dropout max {float(np.max(cvd_pct.liquid_dropout)):.5f}")
+    pvt_pct = PVT(gas_gravity=0.757, temperature_F=198.0, condensate_api=41.7,
+                  p_dew=4331.0, p_init=4331.0, initial_cgr=59.7, cvd=cvd_pct)
+    p_chk = np.array([4019.6, 3694.7, 3295.0, 3264.0, 3221.7])
+    z_chk = pvt_pct.z_two_phase(p_chk)
+    check("percent CVD no longer collapses z and flattens p/z",
+          bool(np.all((z_chk > 0.5) & (z_chk < 1.5)))
+          and float(np.ptp(p_chk / z_chk)) > 100.0,
+          f"z {z_chk.min():.3f}-{z_chk.max():.3f}, p/z spread "
+          f"{float(np.ptp(p_chk / z_chk)):,.0f} psia")
+    raised = False
+    try:
+        CVDTable(pressure=np.array([4000.0, 3000, 2000]),
+                 cum_produced_molfrac=np.array([0.0, 400.0, 800.0]))
+    except ValueError:
+        raised = True
+    check("a cumulative mole fraction above 100 is refused outright", raised,
+          "cannot be a fraction or a percentage")
+
+    # 9c3 -- a CVD table that does not span the data is caught, not absorbed
+    cvd_short = CVDTable(
+        pressure=np.array([3000.0, 2700, 2400, 2100, 1800, 1500, 1200, 700]),
+        cum_produced_molfrac=np.array([0, .078, .176, .283, .402, .515,
+                                       .641, .757]))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pvt_short = PVT(gas_gravity=0.72, temperature_F=248,
+                        condensate_api=52.0, p_dew=5100.0, p_init=6400.0,
+                        cvd=cvd_short, initial_cgr=78.0)
+    check("a CVD table starting far below the dew point is flagged",
+          bool(pvt_short.cvd_warning) and "dew point" in pvt_short.cvd_warning,
+          pvt_short.cvd_warning[:90])
+    check("CVD coverage is reported against the data range",
+          bool(cvd_short.coverage_note(3200, 4100))
+          and not cvd_short.coverage_note(800, 2900),
+          "short table flagged against 3,200-4,100 psia, accepted for "
+          "800-2,900")
+    p_deg = np.linspace(4090.0, 3220.0, 8)
+    g_deg = np.linspace(0.0, 18900.0, 8)
+    mb_deg = material_balance_pz(p_deg, g_deg, pvt_short)
+    check("a degenerate two-phase z is named, not called pressure support",
+          (not mb_deg.pz_trend_ok) and "degenerate" in mb_deg.pz_note
+          and "CVD" in mb_deg.pz_note,
+          f"p/z spread {float(np.ptp(mb_deg.pz)):.3f} psia -> "
+          f"{mb_deg.pz_note[:60]}...")
+    # Below the last laboratory stage the produced fraction must keep rising,
+    # not sit on its final value - a clamp there flattens p/z exactly as above.
+    cvd_hi = CVDTable(pressure=np.array([4087.0, 3600, 3100, 2500]),
+                      cum_produced_molfrac=np.array([0, .078, .176, .283]))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pvt_hi = PVT(gas_gravity=0.72653, temperature_F=198.0,
+                     condensate_api=60.9, p_dew=4087.0, p_init=4087.0,
+                     cvd=cvd_hi, initial_cgr=37.6)
+    p_lowend = np.array([2500.0, 2000.0, 1500.0, 1200.0])
+    pz_lowend = p_lowend / pvt_hi.z_two_phase(p_lowend)
+    check("p/z keeps falling below the last CVD stage",
+          bool(np.all(np.diff(pz_lowend) < 0)),
+          "p/z " + " > ".join(f"{v:,.0f}" for v in pz_lowend))
+
+    # 9c4 -- a Fetkovich fit that did not converge is refused, not reported
+    check("an unconverged aquifer fit is caught by every check",
+          len(fetkovich_health({"rms_pct": 46.44, "we_frac_hcpv": 0.97,
+                                "G_mmscf": 42065.0,
+                                "g_range_mmscf": (46272.0, 92543.0)})) == 3,
+          "rms, influx fraction and G outside its own locus")
+    check("a good aquifer fit passes all of them",
+          fetkovich_health({"rms_pct": 1.48, "we_frac_hcpv": 0.14,
+                            "G_mmscf": 77918.0,
+                            "g_range_mmscf": (71054.0, 86058.0)}) == [],
+          "no complaints")
 
     # 9d1 -- the forecast cap is chosen by drive, not fixed on the p/z line
     ho_cap = material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi)
