@@ -424,7 +424,8 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
                  settings: tuple, well_col: Optional[str]):
     """Analyse every well. Keyed on the dataframe, PVT signature and settings."""
     (q_econ, model, terminal, t_max, run_mc, n_mc, use_mb, use_fmb, cap,
-     rate_basis, min_uptime, outlier_sigma, fit_from_bdf, window) = settings
+     rate_basis, min_uptime, outlier_sigma, fit_from_bdf, window,
+     mb_pi, mb_skip, use_aq) = settings
     # No surface processing is applied, so "sales gas" is the separator gas and
     # plant NGL is zero. Both are reported on the separator-gas basis below.
     split = dca.ProductSplit(inert_fraction=0.0, fuel_flare_fraction=0.0,
@@ -452,7 +453,10 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
                 pdata, _pvt, well=name, q_econ_mscfd=q_econ, select=model,
                 terminal_decline_pct_yr=terminal, t_max_years=t_max,
                 products=split, run_monte_carlo=run_mc, n_mc=n_mc,
-                use_material_balance=use_mb, use_fmb=use_fmb,
+                use_material_balance=use_mb,
+                mb_p_initial=(mb_pi if mb_pi and mb_pi > 0 else None),
+                mb_skip_early=int(mb_skip), use_aquifer=use_aq,
+                use_fmb=use_fmb,
                 apply_ogip_cap=cap, fit_from_bdf=fit_from_bdf,
                 fit_window_days=window, verbose=False)
         except Exception as exc:
@@ -513,8 +517,12 @@ with st.sidebar:
     p_init = c1.number_input("Initial pressure (psia)", 200.0, 20000.0, 6400.0,
                              50.0)
     p_dew = c2.number_input("Dew point (psia)", 0.0, 20000.0, 5100.0, 50.0)
-    initial_cgr = st.number_input("Initial CGR (STB/MMscf)", 0.0, 500.0, 78.0,
-                                  1.0)
+    initial_cgr = st.number_input(
+        "Initial CGR (STB/MMscf)", 0.0, 500.0, 78.0, 1.0,
+        help="Stock tank condensate yield of the produced wellstream at "
+             "initial reservoir pressure. If initial pressure is below dew "
+             "point, use the vapour/produced CGR at the initial pressure "
+             "rather than the above dewpoint fluid CGR.")
     use_wellstream = st.toggle(
         "Use wellstream gravity for PVT", value=True,
         help="Correct above the dew point: the reservoir flows one phase, so "
@@ -558,6 +566,22 @@ with st.sidebar:
                             value=False,
                             help="Biased low on a condensate well below the "
                                  "dew point - read it as a lower bound.")
+        mb_pi = st.number_input(
+            "Material balance p_i (0 = extrapolate)", 0.0, 2.0e5, 0.0, 50.0,
+            help="Leave at 0 and the reference is extrapolated from the p/z "
+                 "line to zero cumulative, which is what makes the answer "
+                 "ORIGINAL gas in place rather than gas in place on the day "
+                 "of the first survey. Set it only if a real initial pressure "
+                 "is known.")
+        use_aq = st.toggle(
+            "Fit a Fetkovich aquifer", value=True,
+            help="Adds a second or two per well. Worth it whenever the drive "
+                 "is not volumetric; on a closed tank it returns negligible "
+                 "influx, which is the cross-check passing.")
+        mb_skip = st.number_input(
+            "Drop earliest surveys", 0, 20, 0, 1,
+            help="Use this when the consistency guard fires and the first "
+                 "survey predates a reliable reference.")
         cap_ogip = st.toggle("Cap forecast at material-balance OGIP",
                              value=True)
         run_mc = st.toggle("Run Monte Carlo", value=True)
@@ -839,7 +863,7 @@ if not auto_window:
 
 settings = (q_econ, model_choice, terminal, float(t_max), run_mc, int(n_mc),
             use_mb, use_fmb, cap_ogip, rate_basis, min_uptime, outlier_sigma,
-            auto_window, window)
+            auto_window, window, float(mb_pi), int(mb_skip), use_aq)
 with st.spinner("Fitting declines, yield models and material balance..."):
     try:
         results, summary, profile, errors = run_analysis(
@@ -899,11 +923,15 @@ tabs = st.tabs(["Data & QC", "Decline fit", "Yield", "Material balance",
 # ------------------------------------------------------------------- Data & QC
 with tabs[0]:
     qc = res.data.qc
-    k = st.columns(5)
+    k = st.columns(6)
     k[0].metric("Rows in", qc.n_input)
     k[1].metric("Rows fitted on", qc.n_after_screen)
     k[2].metric("Outliers removed", qc.n_outliers_removed)
     k[3].metric("Low-uptime rows", qc.n_low_uptime_removed)
+    k[5].metric("Pressure surveys", qc.n_pressure_surveys,
+                help="Counted on the full record. Surveys are kept for the "
+                     "material balance even when the rate QC drops that "
+                     "month.")
     k[4].metric("Plateau ends",
                 f"{qc.plateau_end_days / dca.DAYS_PER_YEAR:.2f} yr"
                 if qc.plateau_end_days is not None else "n/a")
@@ -965,8 +993,13 @@ with tabs[2]:
 # ----------------------------------------------------------- Material balance
 with tabs[3]:
     if res.matbal is None:
-        st.info("No reservoir pressure data. Supply a `p_res` column to run "
-                "the material balance.")
+        st.info(res.settings.get("matbal_note")
+                or "No reservoir pressure data. Supply a `p_res` column to "
+                   "run the material balance.")
+        surv = res.data.surveys
+        if not surv.empty:
+            st.caption(f"{len(surv)} pressure survey(s) found in the record:")
+            show_df(surv, hide_index=True)
     else:
         truth = st.session_state.get("truth_ogip", {}).get(sel)
         if truth:
@@ -983,7 +1016,171 @@ with tabs[3]:
             note("The example data comes from a reservoir model whose gas in "
                  "place is known, so you can see what the two-phase material "
                  "balance recovers and what the single-phase shortcut costs.")
-        show_fig(ch.chart_pz(res, THEME, height=440), key="mb_pz")
+        mb = res.matbal
+        k = st.columns(5)
+        k[0].metric("OGIP (p/z line)", f"{mb.ogip_mmscf:,.0f} MMscf",
+                    f"R² {mb.r2:.3f}", delta_color="off")
+        k[1].metric("G ceiling (We ≥ 0)",
+                    f"{mb.g_ceiling_mmscf:,.0f} MMscf"
+                    if np.isfinite(mb.g_ceiling_mmscf) else "n/a",
+                    help="min(F/Eg). Influx can only add to the withdrawal, "
+                         "so this is a hard upper bound on gas in place "
+                         "however straight the p/z plot looks.")
+        k[2].metric("F/Eg rise",
+                    f"{mb.ho_rise:.2f}×" if np.isfinite(mb.ho_rise) else "n/a")
+        k[3].metric("Drive", mb.drive.title())
+        k[4].metric("Produced", f"{mb.gp_now:,.0f} MMscf")
+
+        if mb.impossible:
+            warn(f"<b>Consistency guard.</b> Material balance requires "
+                 f"G ≤ min(F/Eg) = {mb.g_ceiling_mmscf:,.0f} MMscf because "
+                 f"We ≥ 0, but {mb.gp_now:,.0f} MMscf has already been "
+                 "produced. The surveys and the volumes cannot both be right, "
+                 "and no aquifer model rescues that. The usual cause is a "
+                 "reference pressure taken <b>after</b> first production — p_i "
+                 "is then too low, every Eg downstream too small and F/Eg too "
+                 "large everywhere. Try dropping the earliest survey below.")
+        elif mb.drive == "volumetric":
+            st.success(f"**Volumetric depletion.** F/Eg is flat "
+                       f"({mb.ho_rise:.2f}× across the record), so the gas is "
+                       "producing by its own expansion and the p/z intercept "
+                       "is a real number.")
+        elif mb.drive == "borderline":
+            warn(f"<b>Borderline — F/Eg climbs {mb.ho_rise:.2f}×.</b> Under "
+                 "the 1.25× at which this calls water drive, but not flat "
+                 "either, and a rise this size is what early or weak pressure "
+                 "support looks like before it becomes obvious. Treat the p/z "
+                 "intercept as an upper bound and check whether produced "
+                 "water is accelerating.")
+        elif mb.drive == "water drive":
+            warn(f"<b>Water drive or pressure support.</b> F/Eg climbs "
+                 f"{mb.ho_rise:.2f}×, so something outside the gas is "
+                 "supplying energy. The p/z intercept is an <b>artefact, not "
+                 "a volume</b> — support holds pressure up, which flattens the "
+                 "trend and inflates the intercept. Use the ceiling instead.")
+
+        if mb.ogip_exceeds_ceiling:
+            warn(f"<b>The p/z intercept is above what material balance "
+                 f"allows.</b> Since We ≥ 0, G ≤ min(F/Eg) = "
+                 f"<b>{mb.g_ceiling_mmscf:,.0f} MMscf</b>, but the straight "
+                 f"line reads {mb.ogip_mmscf:,.0f} — "
+                 f"{mb.ogip_mmscf / mb.g_ceiling_mmscf:.2f}× the ceiling. Take "
+                 "the ceiling as the upper bound on this tank and treat the "
+                 "intercept as what it is: a line fitted through a trend that "
+                 "is curving.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            show_fig(ch.chart_pz(res, THEME), key="mb_pz")
+            st.caption("**p/z vs Gp.** Straight for a volumetric tank, and the "
+                       "intercept is OGIP. But a straight-*looking* p/z plot "
+                       "is not evidence of one — the panel beside it is.")
+        with c2:
+            show_fig(ch.chart_havlena_odeh(res, THEME), key="mb_ho")
+            st.caption("**Havlena–Odeh.** F = G·Eg + We. Flat means We ≈ 0 and "
+                       "the level *is* G. Rising means influx. This is the "
+                       "discriminator.")
+
+        show_fig(ch.chart_apparent_g(res, THEME), key="mb_appg")
+        ho = mb.ho_table
+        u = ho["apparent_G_usable"].to_numpy()
+        if u.sum() >= 2:
+            vals = ho.loc[u, "apparent_G_mmscf"].to_numpy()
+            spread = float(vals[-1] / vals[0]) if vals[0] > 0 else float("nan")
+            if np.isfinite(spread) and spread > 1.10:
+                warn(f"<b>Apparent G climbs {spread:.2f}× across the "
+                     f"surveys</b>, from {vals[0]:,.0f} to {vals[-1]:,.0f} "
+                     "MMscf. A closed tank returns the same number every time; "
+                     "support holds p/z up, which inflates every estimate and "
+                     "the later ones most. So the <b>smallest</b> value is the "
+                     f"tightest bound: <b>G ≤ {mb.g_bound_mmscf:,.0f} "
+                     "MMscf</b>, and the straight-line intercept is the least "
+                     "reliable reading of the set because it is dominated by "
+                     "the latest, most inflated points.")
+            elif np.isfinite(spread) and spread < 0.91:
+                warn(f"<b>Apparent G falls {spread:.2f}× across the "
+                     "surveys.</b> Influx only accumulates, so it cannot "
+                     "produce a falling trend. Suspect the reference pressure, "
+                     "the datum correction, or production allocated to this "
+                     "well.")
+            else:
+                st.success(f"**Apparent G is level ({spread:.2f}× across the "
+                           f"surveys)** at about {np.median(vals):,.0f} MMscf. "
+                           "That is what a closed tank looks like, and it is "
+                           "independent confirmation of the p/z intercept.")
+            tbl = ho.loc[u, ["p", "Gp_mmscf", "depleted_frac",
+                             "F_over_Eg_mmscf", "apparent_G_mmscf"]].copy()
+            tbl.columns = ["p (psia)", "Gp (MMscf)", "Depleted",
+                           "F/Eg (MMscf)", "Apparent G (MMscf)"]
+            show_df(tbl.style.format({
+                "p (psia)": "{:,.0f}", "Gp (MMscf)": "{:,.0f}",
+                "Depleted": "{:.1%}", "F/Eg (MMscf)": "{:,.0f}",
+                "Apparent G (MMscf)": "{:,.0f}"}), hide_index=True)
+
+        fk = mb.fetkovich
+        if fk:
+            st.markdown("#### Fetkovich aquifer fit")
+            a = st.columns(5)
+            a[0].metric("G", f"{fk['G_mmscf']:,.0f} MMscf")
+            a[1].metric("Wei", f"{fk['Wei_mmbbl']:,.0f} MMbbl")
+            a[2].metric("J", f"{fk['J_bbl_d_psi']:,.2f} bbl/d/psi")
+            a[3].metric("We to date", f"{fk['We_mmbbl']:,.1f} MMbbl")
+            a[4].metric("rms", f"{fk['rms_pct']:.2f} %")
+
+            lo, hi = fk["g_range_mmscf"]
+            wef = 100 * fk.get("we_frac_hcpv", float("nan"))
+            if wef < 2.0:
+                st.success(
+                    f"The aquifer fit finds **{fk['We_mmbbl']:,.2f} MMbbl of "
+                    f"influx — {wef:.1f}% of the reservoir's hydrocarbon pore "
+                    "volume**, which is nothing. That is the cross-check "
+                    "passing: this reservoir does not need an aquifer to "
+                    f"explain its pressure history, and its independent G of "
+                    f"{fk['G_mmscf']:,.0f} MMscf sits beside the p/z intercept "
+                    f"of {mb.ogip_mmscf:,.0f} MMscf.")
+            else:
+                st.info(
+                    f"**Accounting for influx, G is {fk['G_mmscf']:,.0f} MMscf** "
+                    f"— against {mb.ogip_mmscf:,.0f} MMscf from the straight "
+                    "line, which assumed there was none. The model needs "
+                    f"{fk['We_mmbbl']:,.1f} MMbbl of water to have entered the "
+                    f"reservoir — {wef:.0f}% of its hydrocarbon pore volume — "
+                    "to hold the pressure up as observed.")
+
+            width = hi / lo if lo > 0 else float("inf")
+            if width > 1.15:
+                warn("<b>The solution is not unique.</b> A large aquifer with "
+                     "a small J and a small aquifer with a large J bend the "
+                     "same pressure history over a finite record; only late "
+                     "depletion of the aquifer itself separates them. The data "
+                     f"constrain G only to <b>{lo:,.0f} – {hi:,.0f} MMscf</b>, "
+                     "and that range — not the single best triplet above — is "
+                     "the honest output. The chart below is the valley being "
+                     "quoted.")
+            else:
+                note(f"The fit is well constrained here: G lies between "
+                     f"<b>{lo:,.0f} and {hi:,.0f} MMscf</b> "
+                     f"({100 * (width - 1):.0f}% wide). That is unusual — the "
+                     "aquifer solution is normally a long valley rather than a "
+                     "point, because a big aquifer with a small J and a small "
+                     "one with a big J bend the same pressure history.")
+
+            f1, f2 = st.columns(2)
+            with f1:
+                show_fig(ch.chart_aquifer_match(res, THEME), key="aq_match")
+            with f2:
+                show_fig(ch.chart_aquifer_locus(res, THEME), key="aq_locus")
+            show_fig(ch.chart_aquifer_influx(res, THEME), key="aq_we")
+            if fk["rms_pct"] > 10:
+                warn(f"rms {fk['rms_pct']:.1f}% is above 10% — the model "
+                     "cannot reproduce the pressure history. Treat the "
+                     "parameters as indicative only.")
+            with st.expander("Locus — best achievable fit at each G"):
+                show_df(fk["locus"].style.format({
+                    "G_mmscf": "{:,.0f}", "Wei_mmbbl": "{:,.1f}",
+                    "tau_days": "{:,.0f}", "J_bbl_d_psi": "{:,.2f}",
+                    "rms_pct": "{:.2f}"}), hide_index=True)
+
         if res.matbal.ogip_single_phase:
             delta = 100 * (res.matbal.ogip_single_phase
                            / res.matbal.ogip_mmscf - 1)

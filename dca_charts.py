@@ -83,18 +83,20 @@ def _layout(fig: go.Figure, theme: str, title: str, xlabel: str, ylabel: str,
     """Apply the shared chart chrome. Called by every chart in this module."""
     c = palette(theme)
     fig.update_layout(
-        title=dict(text=title, x=0, xanchor="left",
+        title=dict(text=title, x=0, xanchor="left", y=0.985, yanchor="top",
                    font=dict(size=15, color=c["ink"], family=FONT)),
         paper_bgcolor=c["surface"],
         plot_bgcolor=c["surface"],
         font=dict(family=FONT, size=12, color=c["ink2"]),
-        margin=dict(l=8, r=8, t=48, b=8),
+        # Room for the title AND a legend row beneath it: at two-column width
+        # the legend wraps back over the title if the margin is any tighter.
+        margin=dict(l=8, r=8, t=74, b=8),
         height=height,
         hovermode="closest",
         hoverlabel=dict(font=dict(family=FONT, size=12),
                         bgcolor=c["surface"], bordercolor=c["axis"]),
         showlegend=legend,
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right",
+        legend=dict(orientation="h", yanchor="bottom", y=1.015, xanchor="right",
                     x=1.0, font=dict(size=11, color=c["ink2"]),
                     bgcolor="rgba(0,0,0,0)"),
         dragmode="pan",
@@ -475,3 +477,155 @@ def chart_well_bars(summary: pd.DataFrame, column: str, title: str,
     _layout(fig, theme, title, xlabel, "", height=height, legend=False)
     fig.update_yaxes(showgrid=False)
     return fig
+
+
+def chart_havlena_odeh(res, theme: str = "light", height: int = 380) -> go.Figure:
+    """F/Eg against cumulative. Flat means no influx and the level IS G.
+
+    This is the discriminator the p/z plot cannot be: a supported reservoir
+    produces a perfectly straight p/z line with an inflated intercept, and only
+    this panel tells you it happened.
+    """
+    c = palette(theme)
+    mb = res.matbal
+    if mb is None or mb.ho_table.empty:
+        return _empty(theme, "No material balance available", height)
+    d = mb.ho_table
+    ok = d["F_over_Eg_reliable"].to_numpy()
+    fig = go.Figure()
+    if ok.any():
+        fig.add_trace(go.Scatter(
+            x=d.loc[ok, "Gp_mmscf"], y=d.loc[ok, "F_over_Eg_mmscf"],
+            mode="lines+markers", name="F / Eg",
+            line=dict(width=2.4, color=c["series"][0]),
+            marker=dict(size=8, line=dict(width=1.2, color=c["surface"])),
+            hovertemplate=("Gp %{x:,.0f} MMscf<br>F/Eg %{y:,.0f} MMscf"
+                           "<extra></extra>")))
+    weak = d["F_over_Eg_mmscf"].notna().to_numpy() & ~ok
+    if weak.any():
+        fig.add_trace(go.Scatter(
+            x=d.loc[weak, "Gp_mmscf"], y=d.loc[weak, "F_over_Eg_mmscf"],
+            mode="markers", name="too near the reference",
+            marker=dict(size=9, color=c["muted"], symbol="circle-open"),
+            hovertemplate="Eg is too small here to trust<extra></extra>"))
+    if np.isfinite(mb.g_ceiling_mmscf):
+        fig.add_hline(y=mb.g_ceiling_mmscf,
+                      line=dict(color=c["series"][1], width=1.8, dash="dash"),
+                      annotation_text=f"ceiling {mb.g_ceiling_mmscf:,.0f} MMscf",
+                      annotation_position="bottom right",
+                      annotation_font=dict(size=10, color=c["ink2"]))
+    if np.isfinite(mb.ogip_mmscf):
+        fig.add_hline(y=mb.ogip_mmscf,
+                      line=dict(color=c["critical"], width=1.4, dash="dot"),
+                      annotation_text=f"p/z intercept {mb.ogip_mmscf:,.0f}",
+                      annotation_position="top right",
+                      annotation_font=dict(size=10, color=c["critical"]))
+    return _layout(fig, theme, "Havlena-Odeh:  F = G·Eg + We",
+                   "Cumulative wellstream gas (MMscf)", "F / Eg  (MMscf)",
+                   height=height)
+
+
+def chart_apparent_g(res, theme: str = "light", height: int = 340) -> go.Figure:
+    """Apparent G survey by survey. A closed tank returns one number."""
+    c = palette(theme)
+    mb = res.matbal
+    if mb is None or mb.ho_table.empty:
+        return _empty(theme, "No material balance available", height)
+    d = mb.ho_table
+    ok = d["apparent_G_usable"].to_numpy()
+    if not ok.any():
+        return _empty(theme, "No survey is deep enough into depletion "
+                             "to give an apparent G", height)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d.loc[ok, "Gp_mmscf"], y=d.loc[ok, "apparent_G_mmscf"],
+        mode="lines+markers", name="apparent G",
+        line=dict(width=2.4, color=c["series"][2]),
+        marker=dict(size=9, line=dict(width=1.2, color=c["surface"])),
+        customdata=d.loc[ok, "p"],
+        hovertemplate=("Gp %{x:,.0f} MMscf<br>p %{customdata:,.0f} psia<br>"
+                       "apparent G %{y:,.0f} MMscf<extra></extra>")))
+    if np.isfinite(mb.g_bound_mmscf):
+        fig.add_hline(y=mb.g_bound_mmscf,
+                      line=dict(color=c["series"][1], width=1.8, dash="dash"),
+                      annotation_text=f"tightest bound {mb.g_bound_mmscf:,.0f}",
+                      annotation_position="bottom right",
+                      annotation_font=dict(size=10, color=c["ink2"]))
+    return _layout(fig, theme,
+                   "Apparent G:  Gp / (1 − (p/z)/(p/z)ᵢ)",
+                   "Cumulative wellstream gas (MMscf)", "Apparent G (MMscf)",
+                   height=height, legend=False)
+
+
+def chart_aquifer_match(res, theme: str = "light", height: int = 360) -> go.Figure:
+    """Observed against Fetkovich-predicted pressure. The fit's own evidence."""
+    c = palette(theme)
+    f = res.matbal.fetkovich if res.matbal else None
+    if not f:
+        return _empty(theme, "No aquifer fit", height)
+    yrs = np.asarray(f["t_days"], float) / DAYS_PER_YEAR
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=yrs, y=f["p_observed"], mode="markers", name="Observed",
+        marker=dict(size=9, color=c["series"][0],
+                    line=dict(width=1.2, color=c["surface"])),
+        hovertemplate="Year %{x:.1f}<br>%{y:,.0f} psia<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=yrs, y=f["p_predicted"], mode="lines+markers", name="Fetkovich model",
+        line=dict(width=2.4, color=c["series"][1]),
+        marker=dict(size=6),
+        hovertemplate="Year %{x:.1f}<br>%{y:,.0f} psia<extra></extra>"))
+    return _layout(fig, theme,
+                   f"Aquifer pressure match  (rms {f['rms_pct']:.2f} %)",
+                   "Years on production", "Reservoir pressure (psia)",
+                   height=height)
+
+
+def chart_aquifer_influx(res, theme: str = "light", height: int = 360) -> go.Figure:
+    """Cumulative influx against cumulative water actually produced."""
+    c = palette(theme)
+    f = res.matbal.fetkovich if res.matbal else None
+    if not f:
+        return _empty(theme, "No aquifer fit", height)
+    yrs = np.asarray(f["t_days"], float) / DAYS_PER_YEAR
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=yrs, y=np.asarray(f["we_bbl"], float) / 1e6, mode="lines",
+        name="Influx We", line=dict(width=2.4, color=c["series"][0]),
+        fill="tozeroy", fillcolor=rgba(c["series"][0], 0.16),
+        hovertemplate="Year %{x:.1f}<br>We %{y:,.2f} MMbbl<extra></extra>"))
+    return _layout(fig, theme, "Cumulative water influx",
+                   "Years on production", "We (MMbbl)", height=height,
+                   legend=False)
+
+
+def chart_aquifer_locus(res, theme: str = "light", height: int = 360) -> go.Figure:
+    """The valley in the objective: which G values the data actually allow."""
+    c = palette(theme)
+    f = res.matbal.fetkovich if res.matbal else None
+    if not f or f["locus"].empty:
+        return _empty(theme, "No aquifer locus", height)
+    d = f["locus"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d["G_mmscf"], y=d["rms_pct"], mode="lines+markers",
+        name="best achievable fit",
+        line=dict(width=2.4, color=c["series"][0]),
+        marker=dict(size=7, line=dict(width=1.2, color=c["surface"])),
+        customdata=np.stack([d["Wei_mmbbl"], d["J_bbl_d_psi"]], axis=-1),
+        hovertemplate=("G %{x:,.0f} MMscf<br>rms %{y:.2f} %<br>"
+                       "Wei %{customdata[0]:,.0f} MMbbl<br>"
+                       "J %{customdata[1]:,.2f} bbl/d/psi<extra></extra>")))
+    fig.add_hline(y=f["rms_threshold"],
+                  line=dict(color=c["series"][1], width=1.6, dash="dash"),
+                  annotation_text="acceptable fit",
+                  annotation_position="top left",
+                  annotation_font=dict(size=10, color=c["ink2"]))
+    lo, hi = f["g_range_mmscf"]
+    fig.add_vrect(x0=lo, x1=hi, fillcolor=c["band"], line_width=0, layer="below",
+                  annotation_text=f"{lo:,.0f} – {hi:,.0f} MMscf",
+                  annotation_position="bottom right",
+                  annotation_font=dict(size=10, color=c["ink2"]))
+    return _layout(fig, theme, "Which G the data allow",
+                   "Gas in place (MMscf)", "Best achievable rms (%)",
+                   height=height, legend=False)

@@ -118,6 +118,7 @@ __all__ = [
     "YieldModel", "fit_yield_model",
     "material_balance_pz", "flowing_material_balance",
     "Forecast", "forecast_products", "monte_carlo_eur", "ProductSplit",
+    "fetkovich_aquifer_fit", "havlena_odeh_gas", "gas_fvf_rb_per_scf",
     "percentiles_petroleum",
     "WellResult", "analyse_well", "analyse_field", "field_profile",
     "detect_decline_start", "simulate_tank", "make_synthetic_well",
@@ -508,6 +509,15 @@ class PVT:
         self._f_muct = interp1d(p, mu * cg, kind="cubic", bounds_error=False,
                                fill_value=(mu[0] * cg[0], mu[-1] * cg[-1]))
 
+        # Pre-sorted p/z -> p inverse. Built once here rather than rebuilt and
+        # re-sorted on every call: the Fetkovich search inverts p/z tens of
+        # thousands of times and that sort dominated the runtime.
+        for attr, zz in (("_inv2", self.z_two_phase(p)), ("_inv1", z)):
+            pzv = p / zz
+            srt = np.argsort(pzv)
+            setattr(self, attr, (np.ascontiguousarray(pzv[srt]),
+                                 np.ascontiguousarray(p[srt])))
+
     # -- public property accessors --------------------------------------
     def z(self, p) -> np.ndarray:
         return np.asarray(self._f_z(np.asarray(p, dtype=float)), dtype=float)
@@ -546,17 +556,27 @@ class PVT:
         z2 = rayes_two_phase_z(p, self.T_R, self.effective_gravity, **self._inerts)
         single = self.z(p)
         if self.p_dew:
+            # Anchor the correlation to the single-phase z AT the dew point.
+            # By definition there is no liquid there, so the two values must
+            # agree; Rayes is an independent regression and does not honour
+            # that on its own. Left unanchored it puts a step in z at the dew
+            # point - a couple of percent for a typical fluid - which makes p/z
+            # discontinuous, breaks the inverse mapping used to turn an
+            # intercept back into a pressure, and quietly corrupts every
+            # apparent-G calculation that straddles the dew point.
+            zd_single = float(self.z(np.array([self.p_dew]))[0])
+            zd_rayes = float(rayes_two_phase_z(
+                np.array([float(self.p_dew)]), self.T_R,
+                self.effective_gravity, **self._inerts)[0])
+            if np.isfinite(zd_rayes) and zd_rayes > 0:
+                z2 = z2 * (zd_single / zd_rayes)
             return np.where(p >= self.p_dew, single, z2)
         return z2
 
     def pressure_from_pz(self, pz, two_phase: bool = True) -> np.ndarray:
         """Invert p/z -> p on the internal grid (the mapping is monotonic)."""
-        pz = np.asarray(pz, dtype=float)
-        p_grid = self._p_grid
-        pz_grid = (p_grid / self.z_two_phase(p_grid) if two_phase
-                   else p_grid / self.z(p_grid))
-        srt = np.argsort(pz_grid)
-        return np.interp(pz, pz_grid[srt], p_grid[srt])
+        xs, ys = self._inv2 if two_phase else self._inv1
+        return np.interp(np.asarray(pz, dtype=float), xs, ys)
 
     def pseudo_time(self, t_days: np.ndarray, p_avg: np.ndarray,
                     p_ref: Optional[float] = None) -> np.ndarray:
@@ -679,6 +699,7 @@ class QCReport:
     n_nonfinite: int = 0
     n_outliers_removed: int = 0
     n_low_uptime_removed: int = 0
+    n_pressure_surveys: int = 0
     bdf_start_index: Optional[int] = None
     bdf_start_days: Optional[float] = None
     plateau_end_index: Optional[int] = None
@@ -721,12 +742,17 @@ class ProductionData:
         Gp_sep       cumulative separator gas, MMscf
         Np_cond      cumulative condensate, Mstb
         cgr          condensate-gas ratio, STB/MMscf
+
+    `df` is the QC-filtered frame used for decline fitting. `full_df` is the
+    same frame before the rate filters, and is what pressure surveys must be
+    read from - see :attr:`surveys`.
     """
     df: pd.DataFrame
     pvt: PVT
     well: str = "WELL"
     qc: QCReport = field(default_factory=QCReport)
     rate_basis: str = "stream-day"      # or 'calendar-day'
+    full_df: Optional[pd.DataFrame] = None
 
     # ---- construction ----------------------------------------------------
     @classmethod
@@ -775,15 +801,21 @@ class ProductionData:
             d["q_water"] = np.nan
 
         # Period length and uptime
-        dt = d["date"].diff().dt.days.astype(float)
+        # The period a row represents runs FORWARD from its own date to the
+        # next one. Differencing backwards labels each row with the previous
+        # month's length, so a 31-day month following February gets a 28-day
+        # period and its days-on is clipped to 28 - quietly losing real volume.
+        dt = (d["date"].shift(-1) - d["date"]).dt.days.astype(float)
         if len(dt) > 1:
-            dt.iloc[0] = dt.iloc[1] if np.isfinite(dt.iloc[1]) else 30.4375
+            dt.iloc[-1] = dt.iloc[-2] if np.isfinite(dt.iloc[-2]) else 30.4375
         else:
-            dt.iloc[0] = 30.4375
+            dt.iloc[-1] = 30.4375
         d["period_days"] = dt.fillna(30.4375).clip(lower=1.0)
         if "days_on" in d.columns:
+            # Allow a little slack before clipping: reported days-on can exceed
+            # a nominal period by a day without being wrong.
             d["days_on"] = d["days_on"].fillna(d["period_days"]).clip(
-                lower=0.0, upper=d["period_days"])
+                lower=0.0, upper=d["period_days"] + 1.0)
         else:
             d["days_on"] = d["period_days"]
             qc.notes.append("No uptime column; assumed fully on-stream.")
@@ -804,7 +836,7 @@ class ProductionData:
         # -- screening ------------------------------------------------------
         nonfinite = (~np.isfinite(d["q_gas"])).sum()
         qc.n_nonfinite = int(nonfinite)
-        d = d[np.isfinite(d["q_gas"])]
+        d["q_gas"] = d["q_gas"].where(np.isfinite(d["q_gas"]), 0.0)
 
         nonpos = (d["q_gas"] <= 0).sum()
         qc.n_zero_or_negative_gas = int(nonpos)
@@ -812,18 +844,17 @@ class ProductionData:
             first_pos = d["q_gas"].gt(0).idxmax() if (d["q_gas"] > 0).any() else None
             if first_pos is not None:
                 d = d.loc[first_pos:]
-        d = d[d["q_gas"] > 0]
-
-        if len(d) < 4:
+        if (d["q_gas"] > 0).sum() < 4:
             raise ValueError(f"[{well}] Fewer than 4 usable points after QC.")
         d = d.reset_index(drop=True)
 
         # -- derived series, computed on the FULL record ---------------------
-        # Cumulatives must be accumulated over every producing month, including
-        # the ones QC is about to exclude from the *fit*. A low-uptime month or
-        # a workover spike still put gas in the pipe; dropping its volume from
-        # the cumulative corrupts the material balance and every rate-vs-
-        # cumulative plot. So accumulate first, filter second.
+        # Shut-in months are kept this far on purpose. They contribute nothing
+        # to the cumulative, but a static pressure survey is almost always run
+        # on a shut-in or short month - dropping those rows here is what made
+        # the material balance report "no pressure data" on wells that plainly
+        # had it. Zero-rate rows are filtered out of the fitting frame further
+        # down, after the surveys have been snapshotted.
         t0 = d["date"].iloc[0]
         d["t"] = (d["date"] - t0).dt.days.astype(float)
         if d["t"].iloc[0] == 0:          # Duong / power-law models need t > 0
@@ -837,39 +868,65 @@ class ProductionData:
         d["Gp_sep"] = np.cumsum(d["q_gas"] * eff) / MSCF_PER_MMSCF       # MMscf
         d["Gp_ws"] = np.cumsum(d["q_ws"] * eff) / MSCF_PER_MMSCF         # MMscf
         d["Np_cond"] = np.cumsum(d["q_cond"] * eff) / 1.0e3              # Mstb
+        if "q_water" in d.columns:
+            d["Wp_water"] = np.cumsum(
+                pd.to_numeric(d["q_water"], errors="coerce").fillna(0.0).clip(
+                    lower=0.0) * eff) / 1.0e3                             # Mstb
         with np.errstate(divide="ignore", invalid="ignore"):
             d["cgr"] = np.where(d["q_gas"] > 0,
                                 d["q_cond"] / (d["q_gas"] / MSCF_PER_MMSCF),
                                 np.nan)                                   # STB/MMscf
 
         # -- exclusions (cumulatives above are already correct) --------------
-        keep_mask = np.ones(len(d), dtype=bool)
+        keep_mask = d["q_gas"].to_numpy() > 0          # shut-in months go now
 
         low_uptime = d["uptime_frac"].to_numpy() < min_uptime_frac
-        qc.n_low_uptime_removed = int(low_uptime.sum())
+        # Count only producing months here; a shut-in month is already counted
+        # under zero/negative gas and should not be double-reported.
+        qc.n_low_uptime_removed = int(
+            (low_uptime & (d["q_gas"].to_numpy() > 0)).sum())
         keep_mask &= ~low_uptime
 
-        if outlier_sigma is not None and len(d) >= outlier_window:
-            lq = np.log(d["q_gas"].to_numpy())
+        producing = d["q_gas"].to_numpy() > 0
+        if outlier_sigma is not None and producing.sum() >= outlier_window:
+            # Shut-in months are NaN here, not -inf: log(0) would poison the
+            # rolling median and take the neighbouring months out with it.
+            q = d["q_gas"].to_numpy(float)
+            lq = np.where(producing, np.log(np.where(producing, q, 1.0)), np.nan)
             med = pd.Series(lq).rolling(outlier_window, center=True,
                                         min_periods=3).median().to_numpy()
             resid = lq - med
             mad = np.nanmedian(np.abs(resid - np.nanmedian(resid)))
             scale = 1.4826 * mad if mad > 0 else np.nanstd(resid)
             if scale and np.isfinite(scale) and scale > 0:
-                out = np.abs(resid) > outlier_sigma * scale
+                out = np.isfinite(resid) & (np.abs(resid) > outlier_sigma * scale)
                 qc.n_outliers_removed = int(out.sum())
                 keep_mask &= ~out
 
-        # Always keep the final point: it carries the cumulative to date.
-        keep_mask[-1] = True
+        # Always keep the last PRODUCING point: it carries the cumulative to
+        # date. Forcing the last row would readmit a trailing shut-in month.
+        last_prod = np.flatnonzero(producing)
+        if last_prod.size:
+            keep_mask[last_prod[-1]] = True
         if keep_mask.sum() < 4:
             raise ValueError(f"[{well}] Fewer than 4 usable points after QC.")
 
+        # Keep the unfiltered record. Static pressure surveys land on whatever
+        # month the gauge was run, which is very often a short or shut-in month
+        # that the rate filters above discard. Reading the material balance off
+        # the filtered frame silently throws those surveys away - and a survey
+        # is a measurement of the reservoir, not of the rate, so the rate
+        # filters have no business removing it.
+        full = d.copy()
         d = d[keep_mask].reset_index(drop=True)
         qc.n_after_screen = len(d)
+        if "p_res" in full.columns:
+            qc.n_pressure_surveys = int(
+                np.isfinite(pd.to_numeric(full["p_res"],
+                                          errors="coerce")).sum())
 
-        obj = cls(df=d, pvt=pvt, well=well, qc=qc, rate_basis=rate_basis)
+        obj = cls(df=d, pvt=pvt, well=well, qc=qc, rate_basis=rate_basis,
+                  full_df=full.reset_index(drop=True))
 
         if detect_bdf:
             p_idx, p_t = detect_decline_start(obj.t, obj.q_ws)
@@ -929,6 +986,24 @@ class ProductionData:
     @property
     def p_res(self) -> Optional[np.ndarray]:
         return self.df["p_res"].to_numpy(float) if "p_res" in self.df else None
+
+    @property
+    def surveys(self) -> pd.DataFrame:
+        """Static pressure surveys with their cumulative, from the FULL record.
+
+        Returns columns date, t, p_res, p_wf, Gp_ws for every row carrying a
+        finite reservoir pressure - including rows the rate QC dropped, because
+        a gauge reading is a measurement of the reservoir and has nothing to do
+        with whether that month's rate was usable.
+        """
+        src = self.full_df if self.full_df is not None else self.df
+        cols = ["date", "t", "p_res", "p_wf", "Gp_ws", "Gp_sep", "Wp_water"]
+        if "p_res" not in src.columns:
+            return pd.DataFrame(columns=cols)
+        pres = pd.to_numeric(src["p_res"], errors="coerce")
+        keep = np.isfinite(pres) & (pres > 0)
+        out = src.loc[keep, [c for c in cols if c in src.columns]].copy()
+        return out.reset_index(drop=True)
 
     def window(self, t_min: Optional[float] = None,
                t_max: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -1884,6 +1959,23 @@ def fit_yield_model(Gp: np.ndarray, cgr: np.ndarray,
 
 @dataclass
 class MaterialBalanceResult:
+    """p/z straight line plus the Havlena-Odeh diagnostics that police it.
+
+    The p/z intercept on its own is not evidence of anything: a water-driven
+    reservoir holds its pressure up, which flattens the trend and inflates the
+    intercept, and the plot still looks perfectly straight while it happens.
+    The fields below are what tell the two apart.
+
+    ho_table            per-survey F, Eg, F/Eg, apparent G and the flags
+    ho_rise             last reliable F/Eg over the first; 1.0 means no influx
+    g_ceiling_mmscf     min(F/Eg). Since We >= 0, this is a hard upper bound
+                        on G whatever the straight line says
+    g_bound_mmscf       smallest apparent G, the same bound reached without
+                        any PVT algebra
+    drive               'volumetric' | 'borderline' | 'water drive'
+    impossible          cumulative production already exceeds the ceiling, so
+                        the surveys and the volumes cannot both be right
+    """
     ogip_mmscf: float
     ogip_stderr: float
     r2: float
@@ -1894,22 +1986,165 @@ class MaterialBalanceResult:
     pz: np.ndarray
     ogip_single_phase: Optional[float] = None
     drive_note: str = ""
+    # -- Havlena-Odeh -----------------------------------------------------
+    ho_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    ho_rise: float = float("nan")
+    g_ceiling_mmscf: float = float("nan")
+    g_bound_mmscf: float = float("nan")
+    drive: str = "unknown"
+    impossible: bool = False
+    p_initial: float = float("nan")
+    p_initial_known: bool = False
+    gp_now: float = float("nan")
+    n_surveys: int = 0
+    n_skipped: int = 0
+    fetkovich: Optional[Dict] = None
+
+    @property
+    def volumetric(self) -> bool:
+        return self.drive == "volumetric"
+
+    @property
+    def ogip_exceeds_ceiling(self) -> bool:
+        """The straight line is reading through curvature it should have caught."""
+        return bool(np.isfinite(self.g_ceiling_mmscf)
+                    and np.isfinite(self.ogip_mmscf)
+                    and self.ogip_mmscf > 1.10 * self.g_ceiling_mmscf
+                    and not self.impossible)
 
     def summary(self) -> str:
         lines = [f"  method            : {self.method}",
-                 f"  (p/z)_i           : {self.pz_i:.1f} psia",
-                 f"  OGIP (wellstream) : {self.ogip_mmscf:,.0f} MMscf "
+                 f"  surveys used      : {self.n_surveys}"
+                 + (f" ({self.n_skipped} earliest dropped)" if self.n_skipped else ""),
+                 f"  p_initial         : {self.p_initial:,.0f} psia "
+                 + ("(as entered)" if self.p_initial_known
+                    else "(extrapolated to zero cumulative)"),
+                 f"  (p/z)_i           : {self.pz_i:,.1f} psia",
+                 f"  OGIP (p/z line)   : {self.ogip_mmscf:,.0f} MMscf "
                  f"+/- {self.ogip_stderr:,.0f}",
                  f"  R2                : {self.r2:.4f}"]
+        if np.isfinite(self.ho_rise):
+            lines.append(f"  F/Eg rise         : {self.ho_rise:.2f}x  -> {self.drive}")
+        if np.isfinite(self.g_ceiling_mmscf):
+            lines.append(f"  G ceiling, We>=0  : {self.g_ceiling_mmscf:,.0f} MMscf "
+                         "= min(F/Eg)")
+        if np.isfinite(self.g_bound_mmscf):
+            lines.append(f"  smallest apparent G: {self.g_bound_mmscf:,.0f} MMscf")
         if self.ogip_single_phase is not None:
             diff = 100.0 * (self.ogip_single_phase / self.ogip_mmscf - 1.0)
             lines.append(f"  OGIP if single-phase z used : "
                          f"{self.ogip_single_phase:,.0f} MMscf ({diff:+.1f} %)")
             lines.append("  (that difference is the cost of ignoring the "
                          "retrograde liquid in the material balance)")
+        if self.impossible:
+            lines.append(f"  GUARD             : {self.gp_now:,.0f} MMscf already "
+                         f"produced exceeds the {self.g_ceiling_mmscf:,.0f} MMscf "
+                         "ceiling -\n                      the surveys and the "
+                         "volumes cannot both be right.")
+        elif self.ogip_exceeds_ceiling:
+            lines.append(f"  WARNING           : the p/z intercept is "
+                         f"{self.ogip_mmscf / self.g_ceiling_mmscf:.2f}x the "
+                         "material-balance ceiling.")
+        if self.fetkovich:
+            f = self.fetkovich
+            lines.append(f"  Fetkovich aquifer : G {f['G_mmscf']:,.0f} MMscf, "
+                         f"Wei {f['Wei_mmbbl']:,.0f} MMbbl, "
+                         f"J {f['J_bbl_d_psi']:,.2f} bbl/d/psi")
+            lines.append(f"                      We {f['We_mmbbl']:,.1f} MMbbl "
+                         f"to date, rms {f['rms_pct']:.2f} %")
+            lines.append(f"                      G is only bounded to "
+                         f"{f['g_range_mmscf'][0]:,.0f}-"
+                         f"{f['g_range_mmscf'][1]:,.0f} MMscf by this fit")
         if self.drive_note:
             lines.append(f"  drive             : {self.drive_note}")
         return "\n".join(lines)
+
+
+def gas_fvf_rb_per_scf(p: np.ndarray, T_R: float, z: np.ndarray) -> np.ndarray:
+    """Gas formation volume factor, reservoir barrels per scf."""
+    return 0.0050346 * np.asarray(z, float) * float(T_R) / np.asarray(p, float)
+
+
+def havlena_odeh_gas(pressure: np.ndarray,
+                     gp_mmscf: np.ndarray,
+                     pvt: PVT,
+                     p_initial: float,
+                     water_mstb: Optional[np.ndarray] = None,
+                     two_phase: bool = True,
+                     method: str = "auto",
+                     include_efw: bool = False,
+                     sw: float = 0.25,
+                     cf: float = 4.0e-6,
+                     cw: float = 3.0e-6,
+                     bw: float = 1.0,
+                     min_depletion: float = 0.05) -> pd.DataFrame:
+    """Havlena-Odeh material balance as a straight line, survey by survey.
+
+        F  =  G * (Eg + Efw)  +  We
+
+    with F the reservoir-volume withdrawal, Eg the gas expansion, Efw the rock
+    and connate-water expansion, and We cumulative influx. Divide through:
+
+        F / (Eg + Efw)  =  G  +  We / (Eg + Efw)
+
+    so plotting F/Eg against cumulative production is the discriminator. **Flat
+    means We is zero and the level is G itself.** Rising means something outside
+    the gas is supplying energy, and the p/z intercept is then an artefact
+    rather than a volume.
+
+    Because We >= 0, every point gives G <= F/Eg, so **min(F/Eg) is a hard
+    ceiling on gas in place** no matter how straight the p/z plot looks.
+
+    Near the reference pressure Eg tends to zero and F/Eg explodes, so points
+    shallower than `min_depletion` are computed but flagged unreliable rather
+    than being allowed to set the ceiling.
+
+    `include_efw` is **off by default**, which is the usual gas convention: gas
+    compressibility dwarfs rock and connate water, so Efw is negligible except
+    right at the reference - and right at the reference is precisely where Eg
+    is small enough for it to distort the ratio. Left off, F/Eg equals G
+    exactly for a closed tank at every depth of depletion, which is what makes
+    the diagnostic readable. Turn it on for a hard-rock or very shallow case
+    where you want the extra term.
+
+    Returns one row per survey with F, Eg, Efw, F/Eg, apparent G and the flags.
+    """
+    p = np.asarray(pressure, dtype=float)
+    g = np.asarray(gp_mmscf, dtype=float)
+    wp = (np.zeros_like(p) if water_mstb is None
+          else np.asarray(water_mstb, dtype=float))
+    pi = float(p_initial)
+
+    zf = (lambda x: pvt.z_two_phase(x, method=method)) if two_phase else pvt.z
+    z = np.asarray(zf(p), dtype=float)
+    zi = float(np.asarray(zf(np.array([pi])), dtype=float)[0])
+
+    bg = gas_fvf_rb_per_scf(p, pvt.T_R, z)                 # rb/scf
+    bgi = float(gas_fvf_rb_per_scf(np.array([pi]), pvt.T_R, np.array([zi]))[0])
+
+    eg = bg - bgi                                          # rb/scf
+    efw = (bgi * ((cw * sw + cf) / max(1.0 - sw, 1e-9)) * (pi - p)
+           if include_efw else np.zeros_like(eg))
+    et = eg + efw
+
+    f = g * 1.0e6 * bg + wp * 1.0e3 * bw                   # rb
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f_over_et = np.where(et > 0, f / et / 1.0e6, np.nan)     # MMscf
+        pz = p / z
+        depleted = 1.0 - pz / (pi / zi)
+        apparent_g = np.where(depleted > 0, g / depleted, np.nan)
+
+    reliable = np.isfinite(f_over_et) & (depleted > min_depletion) & (et > 0)
+    g_usable = np.isfinite(apparent_g) & (depleted > min_depletion) & (g > 0)
+
+    return pd.DataFrame({
+        "p": p, "z": z, "pz": pz, "Gp_mmscf": g, "Wp_mstb": wp,
+        "Bg_rb_per_scf": bg, "Eg_rb_per_scf": eg, "Efw_rb_per_scf": efw,
+        "F_rb": f, "F_over_Eg_mmscf": f_over_et,
+        "depleted_frac": depleted, "apparent_G_mmscf": apparent_g,
+        "F_over_Eg_reliable": reliable, "apparent_G_usable": g_usable,
+    })
 
 
 def material_balance_pz(pressure: np.ndarray,
@@ -1917,10 +2152,35 @@ def material_balance_pz(pressure: np.ndarray,
                         pvt: PVT,
                         two_phase: bool = True,
                         method: str = "auto",
-                        compare_single_phase: bool = True) -> MaterialBalanceResult:
-    """Volumetric gas material balance: regress p/z against cumulative gas.
+                        compare_single_phase: bool = True,
+                        water_mstb: Optional[np.ndarray] = None,
+                        p_initial: Optional[float] = None,
+                        skip_early: int = 0,
+                        include_efw: bool = False,
+                        sw: float = 0.25,
+                        cf: float = 4.0e-6,
+                        cw: float = 3.0e-6,
+                        bw: float = 1.0,
+                        min_depletion: float = 0.05) -> MaterialBalanceResult:
+    """Volumetric gas material balance, policed by Havlena-Odeh.
 
         p/z = (p/z)_i * (1 - Gp/G)      ->      G = -intercept / slope
+
+    The straight line is fitted as before, but the result now also carries the
+    F/Eg drive diagnosis, the We >= 0 ceiling on G, and a per-survey apparent-G
+    table. **A straight-looking p/z plot is not evidence of a volumetric
+    reservoir** - pressure support flattens the trend and inflates the
+    intercept while leaving it perfectly straight. Read `drive`, `ho_rise` and
+    `g_ceiling_mmscf` before quoting `ogip_mmscf`.
+
+    `p_initial` is used as the reference when supplied; otherwise the p/z line
+    is extrapolated to zero cumulative, which is what makes the answer
+    *original* gas in place rather than gas in place at the first survey.
+
+    `skip_early` drops that many earliest surveys. Use it when the consistency
+    guard fires: the usual cause is a reference pressure taken after first
+    production, which makes every Eg downstream too small and F/Eg too large
+    everywhere.
 
     For a retrograde condensate below the dew point you must use a **two-phase**
     z-factor. Below the dew point part of the hydrocarbon has condensed, so the
@@ -1937,8 +2197,16 @@ def material_balance_pz(pressure: np.ndarray,
     """
     p = np.asarray(pressure, dtype=float)
     g = np.asarray(gp_mmscf, dtype=float)
+    w = (np.zeros_like(p) if water_mstb is None
+         else np.asarray(water_mstb, dtype=float))
     ok = np.isfinite(p) & np.isfinite(g) & (p > 0)
-    p, g = p[ok], g[ok]
+    p, g, w = p[ok], g[ok], w[ok]
+    order = np.argsort(g)                      # depletion order, not file order
+    p, g, w = p[order], g[order], w[order]
+
+    n_skipped = int(np.clip(skip_early, 0, max(len(p) - 3, 0)))
+    if n_skipped:
+        p, g, w = p[n_skipped:], g[n_skipped:], w[n_skipped:]
     if len(p) < 3:
         raise ValueError("Need at least 3 pressure/cumulative pairs.")
 
@@ -1979,11 +2247,309 @@ def material_balance_pz(pressure: np.ndarray,
         else:
             note = "p/z is essentially linear - consistent with volumetric depletion."
 
+    # -- Havlena-Odeh ------------------------------------------------------
+    pi_known = p_initial is not None and np.isfinite(p_initial) and p_initial > 0
+    pi = float(p_initial) if pi_known else float(
+        pvt.pressure_from_pz(np.array([res.intercept]), two_phase=two_phase)[0])
+
+    ho = havlena_odeh_gas(p, g, pvt, pi, water_mstb=w, two_phase=two_phase,
+                          method=method, include_efw=include_efw, sw=sw,
+                          cf=cf, cw=cw, bw=bw, min_depletion=min_depletion)
+
+    rel = ho["F_over_Eg_reliable"].to_numpy()
+    ho_rise, ceiling = float("nan"), float("nan")
+    if rel.sum() >= 2:
+        vals = ho.loc[rel, "F_over_Eg_mmscf"].to_numpy()
+        ho_rise = float(vals[-1] / vals[0]) if vals[0] > 0 else float("nan")
+        ceiling = float(np.min(vals))
+    elif rel.sum() == 1:
+        ceiling = float(ho.loc[rel, "F_over_Eg_mmscf"].iloc[0])
+
+    usable = ho["apparent_G_usable"].to_numpy()
+    g_bound = (float(np.nanmin(ho.loc[usable, "apparent_G_mmscf"]))
+               if usable.any() else float("nan"))
+
+    # Thresholds follow the convention that 1.10x is flat, 1.25x is influx, and
+    # the band between them is reported as borderline rather than rounded into
+    # whichever verdict it happens to be nearer.
+    if not np.isfinite(ho_rise):
+        drive = "unknown"
+    elif ho_rise <= 1.10:
+        drive = "volumetric"
+    elif ho_rise <= 1.25:
+        drive = "borderline"
+    else:
+        drive = "water drive"
+
+    gp_now = float(g[-1])
+    impossible = bool(np.isfinite(ceiling) and gp_now > ceiling)
+
     return MaterialBalanceResult(
         ogip_mmscf=float(ogip), ogip_stderr=float(ogip_se),
         r2=float(res.rvalue ** 2), pz_i=float(res.intercept),
         method=("two-phase z" if two_phase else "single-phase z"),
-        pressure=p, gp=g, pz=pz, ogip_single_phase=ogip_sp, drive_note=note)
+        pressure=p, gp=g, pz=pz, ogip_single_phase=ogip_sp, drive_note=note,
+        ho_table=ho, ho_rise=ho_rise, g_ceiling_mmscf=ceiling,
+        g_bound_mmscf=g_bound, drive=drive, impossible=impossible,
+        p_initial=pi, p_initial_known=bool(pi_known), gp_now=gp_now,
+        n_surveys=len(p), n_skipped=n_skipped)
+
+
+
+# ------------------------------------------------------------------------------
+# Fetkovich aquifer
+# ------------------------------------------------------------------------------
+
+def _fetkovich_march(g_scf: float, wei_bbl: float, tau_days: float,
+                     t_days: np.ndarray, gp_scf: np.ndarray, wp_bbl: np.ndarray,
+                     pvt: PVT, pi: float, bgi: float, bw: float,
+                     two_phase: bool, n_inner: int = 12) -> np.ndarray:
+    """March the Fetkovich tank forward and return the predicted pressures.
+
+    Fetkovich treats the aquifer as a tank draining at pseudo-steady state:
+
+        dWe/dt = J * (p_aq - p_res),      p_aq = p_i * (1 - We/Wei)
+
+    which integrates over a step of constant reservoir pressure to
+
+        dWe = (Wei/p_i) * (p_aq - p_res) * [1 - exp(-dt/tau)],   tau = Wei/(J*p_i)
+
+    Pressure is not iterated against a residual here: the gas material balance
+    gives it in closed form once We is known, because
+
+        F = G*Eg + We    ->    Bg = (G*Bgi - We + Wp*Bw) / (G - Gp)
+
+    and p/z follows from Bg directly. The only implicit part is that dWe wants
+    the average reservoir pressure over the step, so the step is repeated a few
+    times with the average updated - which converges in two or three passes.
+    """
+    n = len(t_days)
+    p_pred = np.empty(n, dtype=float)
+    p_pred[0] = pi
+    we = 0.0
+    c = 0.0050346 * pvt.T_R
+
+    for i in range(1, n):
+        dt = max(float(t_days[i] - t_days[i - 1]), 0.0)
+        decay = 1.0 - math.exp(-dt / tau_days) if tau_days > 0 else 1.0
+        p_prev = p_pred[i - 1]
+        p_now = p_prev
+        we_new = we
+        for _ in range(n_inner):
+            p_avg = 0.5 * (p_prev + p_now)
+            p_aq = pi * (1.0 - we / wei_bbl)
+            dwe = (wei_bbl / pi) * (p_aq - p_avg) * decay
+            we_new = max(we + dwe, 0.0)
+            denom = g_scf - gp_scf[i]
+            if denom <= 0:
+                return np.full(n, np.nan)
+            bg = (g_scf * bgi - we_new + wp_bbl[i] * bw) / denom
+            if not np.isfinite(bg) or bg <= 0:
+                return np.full(n, np.nan)
+            p_new = float(pvt.pressure_from_pz(np.array([c / bg]),
+                                               two_phase=two_phase)[0])
+            if abs(p_new - p_now) < 0.05:
+                p_now = p_new
+                break
+            p_now = 0.5 * p_now + 0.5 * p_new
+        we = we_new
+        p_pred[i] = p_now
+    return p_pred
+
+
+def fetkovich_aquifer_fit(t_days: np.ndarray,
+                          pressure: np.ndarray,
+                          gp_mmscf: np.ndarray,
+                          pvt: PVT,
+                          p_initial: float,
+                          water_mstb: Optional[np.ndarray] = None,
+                          two_phase: bool = True,
+                          method: str = "auto",
+                          bw: float = 1.0,
+                          g_grid: int = 10,
+                          wei_grid: int = 11,
+                          tau_grid: int = 11,
+                          g_max_multiple: float = 6.0,
+                          locus_tolerance: float = 1.08,
+                          refine: bool = True) -> Optional[Dict]:
+    """Fit a Fetkovich aquifer to a pressure history: returns G, Wei, J and We.
+
+    The search is over (G, Wei, tau) rather than (G, Wei, J), because tau =
+    Wei/(J*p_i) is the aquifer's response time in days and is the thing the data
+    can actually constrain. J falls out as Wei/(p_i*tau).
+
+    **The solution is not unique, and the locus is the honest output.** A large
+    aquifer with a small J and a small aquifer with a large J deliver nearly the
+    same influx over a finite record; only late depletion of the aquifer itself
+    separates them. The returned `locus` holds every grid triplet within
+    `locus_tolerance` of the best rms, and it is usually a long valley rather
+    than a point. Quote a range from it, not the single best triplet.
+    """
+    t = np.asarray(t_days, dtype=float)
+    p = np.asarray(pressure, dtype=float)
+    g = np.asarray(gp_mmscf, dtype=float)
+    w = (np.zeros_like(p) if water_mstb is None
+         else np.asarray(water_mstb, dtype=float))
+    ok = np.isfinite(t) & np.isfinite(p) & np.isfinite(g) & (p > 0)
+    t, p, g, w = t[ok], p[ok], g[ok], w[ok]
+    order = np.argsort(t)
+    t, p, g, w = t[order], p[order], g[order], w[order]
+    if len(t) < 4:
+        return None
+
+    pi = float(p_initial)
+    zf = (lambda x: pvt.z_two_phase(x, method=method)) if two_phase else pvt.z
+    zi = float(np.asarray(zf(np.array([pi])), dtype=float)[0])
+    bgi = 0.0050346 * zi * pvt.T_R / pi              # rb/scf
+    gp_scf = g * 1.0e6
+    wp_bbl = w * 1.0e3
+
+    gp_max = float(gp_scf.max())
+    g_lo = 1.05 * gp_max
+    g_hi = max(g_max_multiple * gp_max, g_lo * 1.5)
+    span = max(float(t[-1] - t[0]), 1.0)
+
+    # Bounds are enforced inside the objective so every caller - the grid, the
+    # global refine and the profile - obeys them. Without this the optimiser
+    # wanders off to an aquifer of 10^10 MMbbl with a 10^13-day time constant,
+    # which is numerically an inert tank and physically nothing at all.
+    hcpv0 = gp_max * bgi
+    wei_lo, wei_hi = 1.0e-3 * hcpv0, 1.0e4 * hcpv0
+    tau_lo, tau_hi = 1.0e-3 * span, 1.0e4 * span
+
+    def rms(gv: float, weiv: float, tauv: float) -> float:
+        if gv <= g_lo * 0.999 or weiv <= 0 or tauv <= 0:
+            return np.inf
+        if not (wei_lo <= weiv <= wei_hi) or not (tau_lo <= tauv <= tau_hi):
+            return np.inf
+        pp = _fetkovich_march(gv, weiv, tauv, t, gp_scf, wp_bbl, pvt, pi,
+                              bgi, bw, two_phase)
+        if not np.all(np.isfinite(pp)):
+            return np.inf
+        return float(np.sqrt(np.mean(((pp - p) / p) ** 2)) * 100.0)
+
+    # Wei is scaled to the reservoir volume of the gas produced so far, so the
+    # grid spans the same physical range whatever the size of the field.
+    hcpv_bbl = hcpv0
+    gs = np.geomspace(g_lo, g_hi, g_grid)
+    weis = np.geomspace(0.05 * hcpv_bbl, 200.0 * hcpv_bbl, wei_grid)
+    taus = np.geomspace(0.02 * span, 200.0 * span, tau_grid)
+
+    rows = []
+    best = (np.inf, None)
+    for gv in gs:
+        for wv in weis:
+            for tv in taus:
+                e = rms(gv, wv, tv)
+                if np.isfinite(e):
+                    rows.append((gv, wv, tv, e))
+                    if e < best[0]:
+                        best = (e, (gv, wv, tv))
+    if best[1] is None:
+        return None
+
+    gb, wb, tb = best[1]
+    if refine:
+        def obj(x):
+            return rms(math.exp(x[0]), math.exp(x[1]), math.exp(x[2]))
+        try:
+            sol = optimize.minimize(
+                obj, np.log([gb, wb, tb]), method="Nelder-Mead",
+                options=dict(maxiter=400, xatol=1e-3, fatol=1e-4))
+            if np.isfinite(sol.fun) and sol.fun < best[0]:
+                gb, wb, tb = (math.exp(v) for v in sol.x)
+                best = (float(sol.fun), (gb, wb, tb))
+        except Exception:
+            pass
+
+    p_pred = _fetkovich_march(gb, wb, tb, t, gp_scf, wp_bbl, pvt, pi, bgi,
+                              bw, two_phase)
+    # Replay the influx history at the fitted parameters.
+    we_hist, we = np.zeros(len(t)), 0.0
+    for i in range(1, len(t)):
+        dt = max(float(t[i] - t[i - 1]), 0.0)
+        decay = 1.0 - math.exp(-dt / tb) if tb > 0 else 1.0
+        p_avg = 0.5 * (p_pred[i - 1] + p_pred[i])
+        we = max(we + (wb / pi) * (pi * (1.0 - we / wb) - p_avg) * decay, 0.0)
+        we_hist[i] = we
+
+    # -- the locus -------------------------------------------------------
+    # Profile along G: for each candidate gas in place, re-optimise the aquifer
+    # and record the best fit it can manage. That traces the actual valley in
+    # the objective, which a coarse grid cannot - and the valley, not the single
+    # best triplet, is the honest answer. A big aquifer with a small J and a
+    # small one with a big J bend the same pressure history; only late aquifer
+    # depletion tells them apart, and a finite record rarely reaches it.
+    best_rms = float(best[0])
+    thresh = max(best_rms * locus_tolerance, best_rms + 0.05)
+    prof = []
+    for gv in np.geomspace(max(g_lo, 0.55 * gb), 2.2 * gb, 13):
+        def obj_g(x, _g=gv):
+            return rms(_g, math.exp(x[0]), math.exp(x[1]))
+        try:
+            sol = optimize.minimize(obj_g, np.log([wb, tb]), method="Nelder-Mead",
+                                    options=dict(maxiter=160, xatol=1e-2,
+                                                 fatol=1e-3))
+            e, wv, tv = float(sol.fun), math.exp(sol.x[0]), math.exp(sol.x[1])
+        except Exception:
+            continue
+        if np.isfinite(e):
+            prof.append((gv / 1.0e6, wv / 1.0e6, tv, wv / (pi * tv), e))
+
+    loc = pd.DataFrame(prof, columns=["G_mmscf", "Wei_mmbbl", "tau_days",
+                                      "J_bbl_d_psi", "rms_pct"])
+    inside = loc[loc["rms_pct"] <= thresh] if len(loc) else loc
+    # Interpolate where the profile actually crosses the threshold rather than
+    # quantising the range to whichever G values happened to be sampled - with
+    # a tight fit that otherwise collapses to a single point and reports a
+    # range of zero width.
+    g_range = (gb / 1.0e6, gb / 1.0e6)
+    if len(loc) >= 2:
+        gx = loc["G_mmscf"].to_numpy()
+        ex = loc["rms_pct"].to_numpy()
+        i_min = int(np.argmin(ex))
+        lo_g = gx[i_min]
+        for i in range(i_min, 0, -1):
+            if ex[i - 1] > thresh:
+                frac = ((thresh - ex[i]) / (ex[i - 1] - ex[i])
+                        if ex[i - 1] != ex[i] else 0.0)
+                lo_g = gx[i] + frac * (gx[i - 1] - gx[i])
+                break
+            lo_g = gx[i - 1]
+        hi_g = gx[i_min]
+        for i in range(i_min, len(gx) - 1):
+            if ex[i + 1] > thresh:
+                frac = ((thresh - ex[i]) / (ex[i + 1] - ex[i])
+                        if ex[i + 1] != ex[i] else 0.0)
+                hi_g = gx[i] + frac * (gx[i + 1] - gx[i])
+                break
+            hi_g = gx[i + 1]
+        g_range = (float(min(lo_g, hi_g)), float(max(lo_g, hi_g)))
+
+    # We against the reservoir volume it is competing with, so "negligible"
+    # has a denominator instead of being a judgement about a raw barrel count.
+    hcpv_res_bbl = gb * bgi
+    we_frac = float(we_hist[-1] / hcpv_res_bbl) if hcpv_res_bbl > 0 else np.nan
+
+    return {
+        "G_mmscf": gb / 1.0e6,
+        "Wei_mmbbl": wb / 1.0e6,
+        "tau_days": tb,
+        "J_bbl_d_psi": wb / (pi * tb),
+        "We_mmbbl": we_hist[-1] / 1.0e6,
+        "rms_pct": float(best[0]),
+        "p_initial": pi,
+        "t_days": t,
+        "p_observed": p,
+        "p_predicted": p_pred,
+        "we_bbl": we_hist,
+        "gp_mmscf": g,
+        "locus": loc.reset_index(drop=True),
+        "locus_within": inside.reset_index(drop=True),
+        "rms_threshold": thresh,
+        "we_frac_hcpv": we_frac,
+        "g_range_mmscf": g_range,
+    }
 
 
 def flowing_material_balance(t_days: np.ndarray,
@@ -2514,6 +3080,9 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                  b_prior: Optional[Tuple[float, float]] = None,
                  dmin_prior_pct_yr: Optional[Tuple[float, float]] = None,
                  use_material_balance: bool = True,
+                 mb_p_initial: Optional[float] = None,
+                 mb_skip_early: int = 0,
+                 use_aquifer: bool = True,
                  use_fmb: bool = False,
                  apply_ogip_cap: bool = True,
                  prepare_kwargs: Optional[Dict] = None,
@@ -2594,14 +3163,43 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                   fit_dewpoint_break=(gp_dew is None))
 
     # -- material balance -------------------------------------------------
-    matbal = None
-    if use_material_balance and data.p_res is not None:
-        pr = data.p_res
-        okp = np.isfinite(pr)
-        if okp.sum() >= 3:
+    matbal, matbal_note = None, ""
+    if not use_material_balance:
+        matbal_note = "Material balance was switched off."
+    else:
+        # Read the surveys from the unfiltered record: a gauge is usually run
+        # on a short or shut-in month, exactly the months the rate QC drops.
+        surv = data.surveys
+        if surv.empty:
+            matbal_note = ("No reservoir pressure data. Supply a p_res column "
+                           "to run the material balance.")
+        elif len(surv) < 3:
+            matbal_note = (f"Only {len(surv)} pressure survey(s) in the "
+                           "record; at least 3 are needed to fit a p/z line.")
+        else:
             try:
-                matbal = material_balance_pz(pr[okp], data.Gp_ws[okp], pvt)
+                wcol = ("Wp_water" if "Wp_water" in surv.columns else None)
+                matbal = material_balance_pz(
+                    surv["p_res"].to_numpy(float),
+                    surv["Gp_ws"].to_numpy(float), pvt,
+                    water_mstb=(surv[wcol].to_numpy(float) if wcol else None),
+                    p_initial=mb_p_initial, skip_early=mb_skip_early)
+                matbal_note = (f"{matbal.n_surveys} pressure surveys used"
+                               + (f", {matbal.n_skipped} earliest dropped."
+                                  if matbal.n_skipped else "."))
+                if use_aquifer and len(surv) >= 4:
+                    try:
+                        matbal.fetkovich = fetkovich_aquifer_fit(
+                            surv["t"].to_numpy(float)[mb_skip_early:],
+                            surv["p_res"].to_numpy(float)[mb_skip_early:],
+                            surv["Gp_ws"].to_numpy(float)[mb_skip_early:],
+                            pvt, matbal.p_initial,
+                            water_mstb=(surv[wcol].to_numpy(float)[mb_skip_early:]
+                                        if wcol else None))
+                    except Exception as exc:
+                        warnings.warn(f"[{well}] aquifer fit failed: {exc}")
             except Exception as exc:
+                matbal_note = f"Material balance failed: {exc}"
                 warnings.warn(f"[{well}] material balance failed: {exc}")
 
     fmb = None
@@ -2667,6 +3265,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                "fit_window_days": (t_lo, t_hi),
                                "selected_model": key,
                                "ogip_cap_mmscf": ogip_cap,
+                               "matbal_note": matbal_note,
                                "terminal_decline_pct_yr": terminal_decline_pct_yr})
     if verbose:
         res.summary()
@@ -3309,6 +3908,28 @@ def run_self_tests(verbose: bool = True) -> bool:
     # p/z plotted with the single-phase value is too low, the trend too steep
     # and OGIP too small. Near the dew point the two can cross, which is why
     # the module measures the difference instead of assuming a rule of thumb.
+    # z must be continuous at the dew point: no liquid has dropped out yet, so
+    # the two-phase and single-phase values are the same number there.
+    for name, pv in (("CVD table", pvt_cvd), ("Rayes correlation", pvt)):
+        pd_ = float(pv.p_dew)
+        above = float(pv.z_two_phase(np.array([pd_ * 1.0005]))[0])
+        below = float(pv.z_two_phase(np.array([pd_ * 0.9995]))[0])
+        check(f"two-phase z is continuous at the dew point ({name})",
+              abs(below / above - 1.0) < 2e-3,
+              f"{below:.4f} vs {above:.4f}")
+    # and the p/z inverse must round-trip across it
+    for pv in (pvt_cvd, pvt):
+        for p_try in (0.98 * pv.p_dew, 0.7 * pv.p_dew, 0.4 * pv.p_dew):
+            pz_try = p_try / float(pv.z_two_phase(np.array([p_try]))[0])
+            back = float(pv.pressure_from_pz(np.array([pz_try]))[0])
+            ok_all = abs(back / p_try - 1.0) < 2e-3
+            if not ok_all:
+                break
+        if not ok_all:
+            break
+    check("p/z inverts back to the same pressure", ok_all,
+          f"{back:,.0f} vs {p_try:,.0f} psia")
+
     p_deep = np.array([2400.0, 1800.0, 1200.0, 700.0])
     check("two-phase z is below single-phase z well under the dew point",
           bool(np.all(pvt_cvd.z_two_phase(p_deep) < pvt_cvd.z(p_deep)))
@@ -3320,6 +3941,56 @@ def run_self_tests(verbose: bool = True) -> bool:
           f"{mb.ogip_mmscf:,.0f} MMscf "
           f"({100 * (mb.ogip_single_phase / mb.ogip_mmscf - 1):+.1f}%)"
           if mb.ogip_single_phase else "n/a")
+
+    # 9c -- Havlena-Odeh: F/Eg IS G for a closed tank, and influx is caught
+    ho = material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi)
+    rel = ho.ho_table["F_over_Eg_reliable"].to_numpy()
+    fe = ho.ho_table.loc[rel, "F_over_Eg_mmscf"].to_numpy()
+    check("F/Eg equals G at every survey for a closed tank",
+          bool(np.all(np.abs(fe / G - 1.0) < 0.01)),
+          f"spread {100 * (fe.max() / fe.min() - 1):.3f} %")
+    check("closed tank is diagnosed volumetric",
+          ho.drive == "volumetric" and not ho.impossible,
+          f"F/Eg rise {ho.ho_rise:.3f}x")
+    check("the We>=0 ceiling brackets the true G on a closed tank",
+          abs(ho.g_ceiling_mmscf / G - 1.0) < 0.02,
+          f"ceiling {ho.g_ceiling_mmscf:,.0f} vs G {G:,.0f}")
+
+    # Hold the pressure up artificially and the diagnosis must change.
+    p_sup = p_syn + (gp / gp.max()) * 700.0
+    sup = material_balance_pz(p_sup, gp, pvt_cvd, p_initial=pi)
+    check("pressure support is caught by F/Eg",
+          sup.drive in ("borderline", "water drive") and sup.ho_rise > 1.10,
+          f"rise {sup.ho_rise:.2f}x -> {sup.drive}")
+    check("support inflates the p/z intercept above the ceiling",
+          sup.ogip_mmscf > sup.g_ceiling_mmscf > G * 0.95,
+          f"line {sup.ogip_mmscf:,.0f} > ceiling {sup.g_ceiling_mmscf:,.0f}")
+
+    # 9d -- Fetkovich aquifer: recover a known one, and find none when none
+    pi_f = 6400.0
+    zi_f = float(pvt_cvd.z_two_phase(np.array([pi_f]))[0])
+    bgi_f = 0.0050346 * zi_f * pvt_cvd.T_R / pi_f
+    G_t, Wei_t, tau_t = 80_000e6, 40e6, 1500.0
+    t_f = np.linspace(0, 9 * 365.25, 12)
+    gp_f = np.linspace(0, 0.42 * G_t, 12) / 1e6
+    p_f = _fetkovich_march(G_t, Wei_t, tau_t, t_f, gp_f * 1e6, np.zeros(12),
+                           pvt_cvd, pi_f, bgi_f, 1.0, True)
+    fk = fetkovich_aquifer_fit(t_f, p_f, gp_f, pvt_cvd, pi_f)
+    check("Fetkovich recovers a known aquifer",
+          fk is not None and abs(fk["G_mmscf"] / (G_t / 1e6) - 1) < 0.02
+          and fk["rms_pct"] < 0.05,
+          f"G {fk['G_mmscf']:,.0f} vs {G_t / 1e6:,.0f} MMscf, "
+          f"Wei {fk['Wei_mmbbl']:,.1f} vs {Wei_t / 1e6:,.1f} MMbbl, "
+          f"rms {fk['rms_pct']:.3f} %")
+
+    gpv = np.linspace(0, 0.65 * 55_000e6, 10) / 1e6
+    pv = pvt_cvd.pressure_from_pz((pi_f / zi_f) * (1 - gpv * 1e6 / 55_000e6))
+    fk0 = fetkovich_aquifer_fit(np.linspace(0, 8 * 365.25, 10), pv, gpv,
+                                pvt_cvd, pi_f)
+    check("Fetkovich finds no aquifer when there is none",
+          fk0 is not None and fk0["We_mmbbl"] < 0.5
+          and abs(fk0["G_mmscf"] / 55_000 - 1) < 0.02,
+          f"We {fk0['We_mmbbl']:.3f} MMbbl, G {fk0['G_mmscf']:,.0f} MMscf")
 
     # 9b -- the tank model is recovered end to end by the material balance
     df_t = make_synthetic_well(pvt_cvd, ogip_mmscf=52000.0,
