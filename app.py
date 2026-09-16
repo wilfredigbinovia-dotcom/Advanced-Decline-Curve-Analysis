@@ -522,7 +522,7 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
     """Analyse every well. Keyed on the dataframe, PVT signature and settings."""
     (q_econ, model, terminal, t_max, run_mc, n_mc, use_mb, use_fmb, cap,
      rate_basis, min_uptime, outlier_sigma, fit_from_bdf, window,
-     mb_pi, mb_skip, use_aq) = settings
+     mb_pi, mb_skip, use_aq, ogip_mode) = settings
     # No surface processing is applied, so "sales gas" is the separator gas and
     # plant NGL is zero. Both are reported on the separator-gas basis below.
     split = dca.ProductSplit(inert_fraction=0.0, fuel_flare_fraction=0.0,
@@ -554,7 +554,8 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
                 mb_p_initial=(mb_pi if mb_pi and mb_pi > 0 else None),
                 mb_skip_early=int(mb_skip), use_aquifer=use_aq,
                 use_fmb=use_fmb,
-                apply_ogip_cap=cap, fit_from_bdf=fit_from_bdf,
+                apply_ogip_cap=cap, ogip_cap_mode=ogip_mode,
+                fit_from_bdf=fit_from_bdf,
                 fit_window_days=window, verbose=False)
         except Exception as exc:
             errors[name] = str(exc)
@@ -577,7 +578,16 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
             "EUR_condensate_mstb": r.forecast.eur_condensate_mstb,
             "remaining_gas_mmscf": r.forecast.remaining_wellstream_mmscf,
             "life_yr": r.forecast.economic_life_years,
-            "OGIP_matbal_mmscf": (r.matbal.ogip_mmscf if r.matbal else np.nan),
+            "OGIP_pz_mmscf": (r.matbal.ogip_mmscf if r.matbal else np.nan),
+            "OGIP_ceiling_mmscf": (r.matbal.g_ceiling_mmscf
+                                  if r.matbal else np.nan),
+            "OGIP_fetkovich_mmscf": (
+                r.matbal.fetkovich["G_mmscf"]
+                if r.matbal and r.matbal.fetkovich else np.nan),
+            "OGIP_cap_mmscf": (r.ogip_choice.value
+                               if r.ogip_choice else np.nan),
+            "OGIP_cap_source": (r.ogip_choice.source
+                                if r.ogip_choice else "none"),
         }
         if r.mc_stats:
             for k, s in r.mc_stats.items():
@@ -696,6 +706,19 @@ with st.sidebar:
                  "survey predates a reliable reference.")
         cap_ogip = st.toggle("Cap forecast at material-balance OGIP",
                              value=True)
+        OGIP_MODES = {"Auto (by drive)": "auto", "p/z line": "p/z",
+                      "Fetkovich G": "fetkovich", "We ≥ 0 ceiling": "ceiling"}
+        ogip_mode_label = st.selectbox(
+            "Which gas in place", list(OGIP_MODES), index=0,
+            disabled=not cap_ogip,
+            help="The p/z intercept is only gas in place when the tank is "
+                 "closed; under pressure support it is inflated by the "
+                 "influx, which is exactly when a cap matters. Auto takes the "
+                 "p/z line on a volumetric drive, the Fetkovich G when the "
+                 "drive is supported and the aquifer fit is usable, and the "
+                 "min(F/Eg) ceiling otherwise. Every choice is clipped to the "
+                 "ceiling, which no gas in place may exceed.")
+        ogip_mode = OGIP_MODES[ogip_mode_label]
         run_mc = st.toggle("Run Monte Carlo", value=True)
         n_mc = st.slider("Monte Carlo realisations", 200, 4000, 800, 100,
                          disabled=not run_mc)
@@ -1140,7 +1163,8 @@ if not auto_window:
 
 settings = (q_econ, model_choice, terminal, float(t_max), run_mc, int(n_mc),
             use_mb, use_fmb, cap_ogip, rate_basis, min_uptime, outlier_sigma,
-            auto_window, window, float(mb_pi), int(mb_skip), use_aq)
+            auto_window, window, float(mb_pi), int(mb_skip), use_aq,
+            ogip_mode)
 with st.spinner("Fitting declines, yield models and material balance..."):
     try:
         results, summary, profile, errors = run_analysis(
@@ -1343,6 +1367,19 @@ with tabs[3]:
                  "supplying energy. The p/z intercept is an <b>artefact, not "
                  "a volume</b> — support holds pressure up, which flattens the "
                  "trend and inflates the intercept. Use the ceiling instead.")
+
+        oc = res.ogip_choice
+        if oc is not None:
+            if np.isfinite(oc.value):
+                bits = " · ".join(
+                    (f"<b>{k} {v:,.0f}</b>" if k == oc.source
+                     else f"{k} {v:,.0f}")
+                    for k, v in (oc.candidates or {}).items())
+                note(f"<b>Forecast cap: {oc.value:,.0f} MMscf</b> "
+                     f"({oc.source}, ±{100 * oc.rel_sigma:.0f} % in the Monte "
+                     f"Carlo). {oc.reason}<br>Candidates — {bits} MMscf.")
+            else:
+                note(f"<b>The forecast is not capped.</b> {oc.reason}")
 
         if mb.ogip_exceeds_ceiling:
             warn(f"<b>The p/z intercept is above what material balance "

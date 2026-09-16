@@ -119,7 +119,10 @@ __all__ = [
     "material_balance_pz", "flowing_material_balance",
     "Forecast", "forecast_products", "monte_carlo_eur", "ProductSplit",
     "fetkovich_aquifer_fit", "havlena_odeh_gas", "gas_fvf_rb_per_scf",
-    "percentiles_petroleum",
+    "OGIPChoice", "select_ogip",
+    "InitialPressureEstimate", "estimate_initial_pressure",
+    "estimate_initial_pressure_from_wells", "field_survey_table",
+    "parse_dates", "percentiles_petroleum",
     "WellResult", "analyse_well", "analyse_field", "field_profile",
     "detect_decline_start", "simulate_tank", "make_synthetic_well",
     "MaterialBalanceResult", "QCReport", "run_self_tests", "demo",
@@ -2694,6 +2697,162 @@ def estimate_initial_pressure_from_wells(
 # Fetkovich aquifer
 # ------------------------------------------------------------------------------
 
+CEILING_SLACK = 1.05        # how far above min(F/Eg) a cap may sit before clipping
+
+
+@dataclass
+class OGIPChoice:
+    """Which gas in place the forecast is held to, and why that one."""
+    value: float = float("nan")         # MMscf, or nan for no cap
+    source: str = "none"                # 'p/z line' | 'Fetkovich' | 'ceiling'
+    rel_sigma: float = 0.15             # spread for the Monte Carlo cap
+    reason: str = ""
+    candidates: Dict[str, float] = field(default_factory=dict)
+    clipped_to_ceiling: bool = False
+
+    def __repr__(self) -> str:
+        if not np.isfinite(self.value):
+            return f"<OGIPChoice none: {self.reason}>"
+        return (f"<OGIPChoice {self.value:,.0f} MMscf from {self.source} "
+                f"+/-{100 * self.rel_sigma:.0f}%>")
+
+
+def select_ogip(matbal: Optional["MaterialBalanceResult"],
+                fmb: Optional[Dict] = None,
+                mode: str = "auto") -> OGIPChoice:
+    """Pick the gas in place the forecast should be capped at.
+
+    The p/z intercept is NOT the default, because it is only gas in place when
+    the tank is closed. Under pressure support the influx holds p/z up, which
+    flattens the trend and pushes the intercept out past anything the reservoir
+    contains - the same number the drive diagnostics spend their time warning
+    about. Capping a forecast with it in that case is worse than not capping at
+    all: it puts a large, official-looking, wrong volume into the reserves.
+
+    The order of preference, therefore, is by what each number means:
+
+      volumetric      the p/z intercept IS G, and the ceiling agrees with it
+      supported       Fetkovich G, which models the influx instead of absorbing
+                      it into the intercept, when the fit is good and the locus
+                      is not hopelessly wide
+      otherwise       min(F/Eg), the We >= 0 ceiling - not an estimate but a
+                      hard upper bound, which is the right shape for a cap
+
+    Whatever is chosen is clipped to the ceiling, since no model output may
+    exceed a bound that follows from We >= 0 alone.
+
+    `rel_sigma` carries the spread into the Monte Carlo instead of the fixed
+    15 % that used to be assumed for every well: the Fetkovich locus half-width
+    where there is one, the regression standard error on the p/z intercept
+    otherwise.
+    """
+    mode = (mode or "auto").lower()
+    if mode in ("none", "off") or matbal is None:
+        if matbal is None and fmb is not None and mode not in ("none", "off"):
+            v = float(fmb.get("ogip_contacted_mmscf", float("nan")))
+            if np.isfinite(v) and v > 0:
+                return OGIPChoice(value=v, source="FMB (contacted)",
+                                  rel_sigma=0.25,
+                                  reason="No static surveys, so the cap comes "
+                                         "from the flowing material balance. "
+                                         "It measures contacted gas, which on "
+                                         "a condensate well below the dew "
+                                         "point reads low.",
+                                  candidates={"FMB": v})
+        return OGIPChoice(reason=("No material balance, so the forecast is "
+                                  "not capped."), source="none")
+
+    ceil = float(matbal.g_ceiling_mmscf)
+    pz = float(matbal.ogip_mmscf)
+    fk = matbal.fetkovich or None
+    fk_g = float(fk["G_mmscf"]) if fk else float("nan")
+    cands = {"p/z line": pz}
+    if np.isfinite(ceil):
+        cands["We>=0 ceiling"] = ceil
+    if np.isfinite(fk_g):
+        cands["Fetkovich"] = fk_g
+
+    def _sigma_pz() -> float:
+        se = float(matbal.ogip_stderr)
+        if np.isfinite(se) and np.isfinite(pz) and pz > 0:
+            return float(np.clip(se / pz, 0.05, 0.50))
+        return 0.15
+
+    def _sigma_fk() -> float:
+        if fk and np.isfinite(fk_g) and fk_g > 0:
+            lo, hi = fk.get("g_range_mmscf", (np.nan, np.nan))
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                return float(np.clip(0.5 * (hi - lo) / fk_g, 0.05, 0.60))
+        return 0.25
+
+    if mode in ("p/z", "pz", "p/z line"):
+        pick, src, sig = pz, "p/z line", _sigma_pz()
+        why = "Chosen explicitly."
+    elif mode in ("fetkovich", "aquifer"):
+        if not np.isfinite(fk_g):
+            return OGIPChoice(reason="Fetkovich was requested but no aquifer "
+                                     "fit is available; the forecast is not "
+                                     "capped.", candidates=cands)
+        pick, src, sig = fk_g, "Fetkovich", _sigma_fk()
+        why = "Chosen explicitly."
+    elif mode in ("ceiling", "we", "bound"):
+        if not np.isfinite(ceil):
+            return OGIPChoice(reason="The ceiling was requested but F/Eg could "
+                                     "not be evaluated; the forecast is not "
+                                     "capped.", candidates=cands)
+        pick, src, sig = ceil, "We>=0 ceiling", 0.10
+        why = "Chosen explicitly."
+    elif mode != "auto":
+        raise ValueError(f"Unknown OGIP cap mode {mode!r}.")
+    else:
+        volumetric = (matbal.drive == "volumetric"
+                      and not matbal.impossible
+                      and not matbal.ogip_exceeds_ceiling)
+        fk_usable = bool(
+            fk and np.isfinite(fk_g) and fk_g > 0
+            and float(fk.get("rms_pct", 1e9)) < 5.0)
+        if volumetric:
+            pick, src, sig = pz, "p/z line", _sigma_pz()
+            why = (f"F/Eg is flat ({matbal.ho_rise:.2f}x), so the tank is "
+                   "closed and the p/z intercept is gas in place rather than "
+                   "an artefact of pressure support.")
+        elif fk_usable:
+            pick, src, sig = fk_g, "Fetkovich", _sigma_fk()
+            why = (f"The drive reads {matbal.drive} (F/Eg rises "
+                   f"{matbal.ho_rise:.2f}x), so the p/z intercept "
+                   f"({pz:,.0f} MMscf) is inflated by influx. The Fetkovich "
+                   f"fit models that influx explicitly and matches the "
+                   f"pressure history to {float(fk['rms_pct']):.2f} %.")
+        elif np.isfinite(ceil):
+            pick, src, sig = ceil, "We>=0 ceiling", 0.10
+            why = (f"The drive reads {matbal.drive} and no usable aquifer fit "
+                   "is available, so the cap falls back to the hard bound "
+                   "min(F/Eg), which holds whatever the influx turns out to "
+                   "be.")
+        else:
+            pick, src, sig = pz, "p/z line", _sigma_pz()
+            why = ("Neither the ceiling nor an aquifer fit could be evaluated, "
+                   "so the p/z intercept is all there is. Treat the cap as "
+                   "indicative.")
+
+    # min(F/Eg) is a minimum over surveys, so scatter biases it low: on clean
+    # synthetic data it lands within 2 % of the true G, and real surveys are
+    # not clean. A cap that is slightly high merely fails to bite, while one
+    # that is slightly low truncates reserves that are there - so the clip is
+    # given a little room and only fires when the excess is real.
+    clipped = False
+    if np.isfinite(ceil) and np.isfinite(pick) and pick > ceil * CEILING_SLACK:
+        why += (f" Clipped from {pick:,.0f} to the We >= 0 ceiling of "
+                f"{ceil:,.0f} MMscf, which no gas in place may exceed.")
+        pick, clipped = ceil, True
+
+    if not (np.isfinite(pick) and pick > 0):
+        return OGIPChoice(reason="No usable gas in place; the forecast is not "
+                                 "capped.", candidates=cands)
+    return OGIPChoice(value=float(pick), source=src, rel_sigma=float(sig),
+                      reason=why, candidates=cands, clipped_to_ceiling=clipped)
+
+
 def _fetkovich_march(g_scf: float, wei_bbl: float, tau_days: float,
                      t_days: np.ndarray, gp_scf: np.ndarray, wp_bbl: np.ndarray,
                      pvt: PVT, pi: float, bgi: float, bw: float,
@@ -3382,6 +3541,7 @@ class WellResult:
     mc_stats: Optional[Dict[str, Dict[str, float]]] = None
     matbal: Optional[MaterialBalanceResult] = None
     fmb: Optional[Dict[str, float]] = None
+    ogip_choice: Optional[OGIPChoice] = None
     settings: Dict = field(default_factory=dict)
 
     def summary(self, stream=None) -> str:
@@ -3423,6 +3583,21 @@ class WellResult:
                     "figure LOW. Treat it as a lower bound.")
             out += ["-- Flowing material balance " + "-" * 50,
                     "\n".join(fmb_lines), ""]
+        if self.ogip_choice is not None:
+            oc = self.ogip_choice
+            lines = []
+            for k, v in (oc.candidates or {}).items():
+                mark = "  <-- used" if k == oc.source else ""
+                lines.append(f"    {k:<16}: {v:>12,.0f} MMscf{mark}")
+            body = ("\n".join(lines) + "\n" if lines else "")
+            if np.isfinite(oc.value):
+                body += (f"  cap applied       : {oc.value:,.0f} MMscf "
+                         f"({oc.source}, +/-{100 * oc.rel_sigma:.0f} % in the "
+                         f"Monte Carlo)\n")
+            else:
+                body += "  cap applied       : none\n"
+            body += f"  why               : {oc.reason}"
+            out += ["-- Gas in place used for the cap " + "-" * 45, body, ""]
         out += ["-- Deterministic forecast " + "-" * 52, self.forecast.summary(), ""]
         if self.mc_stats:
             out.append("-- Probabilistic EUR (P90 = low case) " + "-" * 40)
@@ -3479,6 +3654,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                  use_aquifer: bool = True,
                  use_fmb: bool = False,
                  apply_ogip_cap: bool = True,
+                 ogip_cap_mode: str = "auto",
                  prepare_kwargs: Optional[Dict] = None,
                  verbose: bool = True) -> WellResult:
     """Run the full gas condensate DCA workflow on one well.
@@ -3609,12 +3785,14 @@ def analyse_well(df: pd.DataFrame | ProductionData,
         except Exception as exc:
             warnings.warn(f"[{well}] FMB failed: {exc}")
 
-    ogip_cap = None
-    if apply_ogip_cap:
-        if matbal is not None:
-            ogip_cap = matbal.ogip_mmscf
-        elif fmb is not None:
-            ogip_cap = fmb["ogip_contacted_mmscf"]
+    # The cap is chosen, not assumed. Which of the three material-balance
+    # numbers is gas in place depends on the drive, and the p/z intercept -
+    # the one this used to take unconditionally - is the wrong one precisely
+    # when the diagnostics are shouting loudest.
+    ogip_choice = select_ogip(matbal, fmb,
+                              mode=("none" if not apply_ogip_cap
+                                    else ogip_cap_mode))
+    ogip_cap = ogip_choice.value if np.isfinite(ogip_choice.value) else None
 
     # -- forecast ---------------------------------------------------------
     t_last = float(data.t[-1])
@@ -3640,7 +3818,8 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                  t_max_years=t_max_years,
                                  b_prior=b_prior,
                                  dmin_prior_pct_yr=dmin_prior_pct_yr,
-                                 ogip_cap_mmscf=ogip_cap)
+                                 ogip_cap_mmscf=ogip_cap,
+                                 ogip_cap_rel_sigma=ogip_choice.rel_sigma)
             mc_stats = {
                 "EUR wellstream gas (MMscf)":
                     percentiles_petroleum(mc["eur_wellstream_mmscf"]),
@@ -3655,10 +3834,15 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     res = WellResult(well=well, data=data, pvt=pvt, model_table=table, fits=fits,
                      best_fit=best, yield_model=yield_model, forecast=fc,
                      mc=mc, mc_stats=mc_stats, matbal=matbal, fmb=fmb,
+                     ogip_choice=ogip_choice,
                      settings={"q_econ_mscfd": q_econ_mscfd,
                                "fit_window_days": (t_lo, t_hi),
                                "selected_model": key,
                                "ogip_cap_mmscf": ogip_cap,
+                               "ogip_cap_source": ogip_choice.source,
+                               "ogip_cap_reason": ogip_choice.reason,
+                               "ogip_cap_rel_sigma": ogip_choice.rel_sigma,
+                               "ogip_candidates": ogip_choice.candidates,
                                "matbal_note": matbal_note,
                                "terminal_decline_pct_yr": terminal_decline_pct_yr})
     if verbose:
@@ -3714,7 +3898,16 @@ def analyse_field(wells: Dict[str, ProductionData] | pd.DataFrame,
             "EUR_sales_gas_mmscf": r.forecast.eur_sales_gas_mmscf,
             "EUR_condensate_mstb": r.forecast.eur_condensate_mstb,
             "life_yr": r.forecast.economic_life_years,
-            "OGIP_matbal_mmscf": (r.matbal.ogip_mmscf if r.matbal else np.nan),
+            "OGIP_pz_mmscf": (r.matbal.ogip_mmscf if r.matbal else np.nan),
+            "OGIP_ceiling_mmscf": (r.matbal.g_ceiling_mmscf
+                                  if r.matbal else np.nan),
+            "OGIP_fetkovich_mmscf": (
+                r.matbal.fetkovich["G_mmscf"]
+                if r.matbal and r.matbal.fetkovich else np.nan),
+            "OGIP_cap_mmscf": (r.ogip_choice.value
+                               if r.ogip_choice else np.nan),
+            "OGIP_cap_source": (r.ogip_choice.source
+                                if r.ogip_choice else "none"),
         }
         if r.mc_stats:
             for k, st in r.mc_stats.items():
@@ -4386,6 +4579,47 @@ def run_self_tests(verbose: bool = True) -> bool:
           and abs(fk0["G_mmscf"] / 55_000 - 1) < 0.02,
           f"We {fk0['We_mmbbl']:.3f} MMbbl, G {fk0['G_mmscf']:,.0f} MMscf")
 
+    # 9d1 -- the forecast cap is chosen by drive, not fixed on the p/z line
+    ho_cap = material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi)
+    pick_closed = select_ogip(ho_cap)
+    check("a closed tank is capped on the p/z line",
+          pick_closed.source == "p/z line"
+          and abs(pick_closed.value / G - 1) < 0.02,
+          f"{pick_closed.value:,.0f} MMscf from {pick_closed.source}")
+
+    sup_cap = material_balance_pz(p_sup, gp, pvt_cvd, p_initial=pi)
+    sup_cap.fetkovich = fetkovich_aquifer_fit(
+        np.linspace(0, 10 * 365.25, len(gp)), p_sup, gp, pvt_cvd, pi)
+    pick_sup = select_ogip(sup_cap)
+    check("a supported tank is NOT capped on the p/z line",
+          pick_sup.source != "p/z line"
+          and pick_sup.value < sup_cap.ogip_mmscf,
+          f"{pick_sup.value:,.0f} MMscf from {pick_sup.source}, vs the p/z "
+          f"line at {sup_cap.ogip_mmscf:,.0f}")
+    check("the cap never exceeds the We>=0 ceiling by more than the slack",
+          all(select_ogip(m, mode=md).value
+              <= m.g_ceiling_mmscf * CEILING_SLACK * 1.0001
+              for m in (ho_cap, sup_cap)
+              for md in ("auto", "p/z", "fetkovich", "ceiling")
+              if np.isfinite(select_ogip(m, mode=md).value)
+              and np.isfinite(m.g_ceiling_mmscf)),
+          f"checked for the closed and supported tanks, every mode, at "
+          f"{100 * (CEILING_SLACK - 1):.0f} % slack on a minimum statistic")
+    check("a cap well above the ceiling is still clipped",
+          select_ogip(sup_cap, mode="p/z").clipped_to_ceiling
+          and select_ogip(sup_cap, mode="p/z").value
+          <= sup_cap.g_ceiling_mmscf * 1.0001,
+          f"p/z {sup_cap.ogip_mmscf:,.0f} clipped to "
+          f"{select_ogip(sup_cap, mode='p/z').value:,.0f} MMscf")
+    check("the Monte Carlo spread comes from the fit, not a fixed 15 %",
+          0.0 < pick_sup.rel_sigma <= 0.60
+          and abs(pick_sup.rel_sigma - 0.15) > 1e-9,
+          f"+/-{100 * pick_sup.rel_sigma:.0f} % from the "
+          f"{pick_sup.source} spread")
+    check("switching the cap off leaves the forecast uncapped",
+          not np.isfinite(select_ogip(sup_cap, mode="none").value),
+          "mode='none' returns no cap")
+
     # 9d2 -- day-first dates are recognised from the shape of the history
     df_dates = pd.Series([f"01/{m:02d}/{y}" for y in (2012, 2013)
                           for m in range(1, 13)])
@@ -4583,7 +4817,8 @@ def demo(outdir: str = "dca_output", n_wells: int = 4,
     print("=" * 78)
     cols = ["well", "model", "b", "Di_pct_yr", "Gp_to_date_mmscf",
             "EUR_wellstream_mmscf", "EUR_sales_gas_mmscf",
-            "EUR_condensate_mstb", "OGIP_matbal_mmscf", "life_yr"]
+            "EUR_condensate_mstb", "OGIP_cap_mmscf",
+            "OGIP_cap_source", "life_yr"]
     print(summary[[c for c in cols if c in summary.columns]]
           .to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
 
