@@ -614,16 +614,30 @@ def chart_aquifer_locus(res, theme: str = "light", height: int = 360) -> go.Figu
     if not f or f["locus"].empty:
         return _empty(theme, "No aquifer locus", height)
     d = f["locus"]
+    # The locus carries whichever two parameters the fitted model uses, so the
+    # hover is built from the frame rather than from hard-coded Fetkovich
+    # column names - which is what broke when a second model arrived.
+    # Wei and J are carried by every model, so prefer them: the hover then
+    # reads the same whichever aquifer law was fitted, and two loci can be
+    # compared without translating parameter names in your head.
+    stable = [c0 for c0 in ("Wei_mmbbl", "J_bbl_d_psi") if c0 in d.columns]
+    par = stable or [col for col in d.columns
+                     if col not in ("G_mmscf", "rms_pct")][:2]
     fig = go.Figure()
+    hover = "G %{x:,.0f} MMscf<br>rms %{y:.2f} %"
+    if par:
+        fig_custom = np.stack([d[col].to_numpy(float) for col in par], axis=-1)
+        for i, col in enumerate(par):
+            hover += f"<br>{col} %{{customdata[{i}]:,.4g}}"
+    else:
+        fig_custom = None
     fig.add_trace(go.Scatter(
         x=d["G_mmscf"], y=d["rms_pct"], mode="lines+markers",
         name="best achievable fit",
         line=dict(width=2.4, color=c["series"][0]),
         marker=dict(size=7, line=dict(width=1.2, color=c["surface"])),
-        customdata=np.stack([d["Wei_mmbbl"], d["J_bbl_d_psi"]], axis=-1),
-        hovertemplate=("G %{x:,.0f} MMscf<br>rms %{y:.2f} %<br>"
-                       "Wei %{customdata[0]:,.0f} MMbbl<br>"
-                       "J %{customdata[1]:,.2f} bbl/d/psi<extra></extra>")))
+        customdata=fig_custom,
+        hovertemplate=hover + "<extra></extra>"))
     fig.add_hline(y=f["rms_threshold"],
                   line=dict(color=c["series"][1], width=1.6, dash="dash"),
                   annotation_text="acceptable fit",
@@ -637,3 +651,88 @@ def chart_aquifer_locus(res, theme: str = "light", height: int = 360) -> go.Figu
     return _layout(fig, theme, "Which G the data allow",
                    "Gas in place (MMscf)", "Best achievable rms (%)",
                    height=height, legend=False)
+
+
+def chart_water_forecast(res, theme: str = "light", q_limit: float = 0.0,
+                         height: int = 380) -> go.Figure:
+    """Produced water, history and trend, against the handling limit.
+
+    Water gets its own panel rather than a second axis on the gas chart. They
+    are different measures on different scales, and overlaying them on twin
+    axes lets you manufacture any correlation you like by choosing the scales.
+    """
+    c = palette(theme)
+    d = res.data
+    wt = res.forecast.water_trend
+    if "q_water" not in d.df.columns:
+        return _empty(theme, "No water rate column", height)
+    qw = pd.to_numeric(d.df["q_water"], errors="coerce").to_numpy(float)
+    if not np.any(np.isfinite(qw) & (qw > 0)):
+        return _empty(theme, "No produced water recorded", height)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d.t / DAYS_PER_YEAR, y=qw, mode="markers", name="Water (measured)",
+        marker=dict(size=7, color=c["series"][0],
+                    line=dict(width=1.2, color=c["surface"])),
+        customdata=d.df["date"].dt.strftime("%b %Y"),
+        hovertemplate=("<b>%{customdata}</b><br>Water %{y:,.0f} STB/d"
+                       "<extra></extra>")))
+
+    if wt is not None:
+        tf = res.forecast.table["t_days"].to_numpy(float)
+        span = np.linspace(float(d.t[0]), float(tf[-1]), 200)
+        fig.add_trace(go.Scatter(
+            x=span / DAYS_PER_YEAR, y=wt.rate(span), mode="lines",
+            name=f"Trend {wt.growth_pct_per_year:+,.0f} %/yr",
+            line=dict(width=2.4, color=c["series"][1]),
+            hovertemplate="%{y:,.0f} STB/d<extra></extra>"))
+
+    if q_limit and q_limit > 0:
+        fig.add_hline(y=q_limit, line=dict(color=c["critical"], width=1.6,
+                                           dash="dash"),
+                      annotation_text=f"limit {q_limit:,.0f} STB/d",
+                      annotation_position="top left",
+                      annotation_font=dict(size=10, color=c["ink2"]))
+    t_end = float(res.data.t[-1]) / DAYS_PER_YEAR
+    fig.add_vline(x=t_end, line=dict(color=c["axis"], width=1.2, dash="dot"),
+                  annotation_text="today", annotation_position="bottom right",
+                  annotation_font=dict(size=10, color=c["muted"]))
+    return _layout(fig, theme, "Produced water and the handling limit",
+                   "Years on production", "Water rate (STB/d)",
+                   log_y=True, height=height)
+
+
+def chart_bank_pi(res, theme: str = "light", height: int = 380) -> go.Figure:
+    """Productivity index against time: the condensate bank, measured.
+
+    q / [m(p_avg) - m(p_wf)] divides out the drawdown and the gas properties,
+    so what is left is mobility and contacted volume. A fall that starts where
+    the reservoir crosses the dew point is the bank.
+    """
+    c = palette(theme)
+    b = getattr(res, "bank", None)
+    if b is None or not b.ok:
+        return _empty(theme,
+                      f"No bank diagnostic — {b.reason if b else 'not run'}",
+                      height)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=b.t_days / DAYS_PER_YEAR, y=b.pi, mode="markers",
+        name="Productivity index",
+        marker=dict(size=7, color=c["series"][0],
+                    line=dict(width=1.2, color=c["surface"])),
+        customdata=b.p_avg,
+        hovertemplate=("%{x:,.1f} yr<br>PI %{y:,.4g}<br>"
+                       "p_avg %{customdata:,.0f} psia<extra></extra>")))
+    if b.p_dew_crossed_days is not None:
+        fig.add_vline(x=b.p_dew_crossed_days / DAYS_PER_YEAR,
+                      line=dict(color=c["critical"], width=1.6, dash="dash"),
+                      annotation_text="dew point crossed",
+                      annotation_position="top right",
+                      annotation_font=dict(size=10, color=c["ink2"]))
+    return _layout(fig, theme,
+                   f"Productivity index — {100 * b.loss_frac:,.0f} % lost",
+                   "Years on production",
+                   "q / [m(p_avg) − m(p_wf)]", log_y=True, height=height,
+                   legend=False)

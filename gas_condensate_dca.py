@@ -116,6 +116,9 @@ from scipy.interpolate import interp1d
 #   v2  dates fixed to ISO YYYY-MM-DD rather than guessed; the estimated-p_i
 #       row dated to the start of a month; a non-declining p/z diagnosed
 #       instead of aborting the material balance.
+#   v9  the aquifer locus always carries Wei and J whatever the model's own
+#       parameters are called, so a consumer keyed on those names survives a
+#       new model arriving; asserted by a contract self-test.
 #   v8  the About tab no longer quotes one well's numbers as general: every
 #       figure is either from the module's own verification case, named as
 #       such, or computed live from the well currently loaded. Limitations are
@@ -136,7 +139,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "8.0"
+__version__ = "9.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -3918,6 +3921,25 @@ def aquifer_fit(t_days: np.ndarray,
             prof.append((gv / 1.0e6, av, bv, e))
 
     loc = pd.DataFrame(prof, columns=["G_mmscf", a_name, b_name, "rms_pct"])
+    # Every locus also carries Wei and J, whatever the model's own parameters
+    # are called. Two reasons. The loci of two models can then be read on the
+    # same quantities and put side by side. And a consumer keyed on these names
+    # - a chart, an export, a spreadsheet - does not break the day a second
+    # model arrives with different ones, which is exactly what happened here.
+    if len(loc):
+        a_col = loc[a_name].to_numpy(float)
+        b_col = loc[b_name].to_numpy(float)
+        if model == "fetkovich":
+            loc["Wei_mmbbl"] = a_col / 1.0e6
+            loc["J_bbl_d_psi"] = a_col / (pi * np.maximum(b_col, 1e-12))
+        else:
+            # B'*p_i is the expansion capacity Fetkovich calls Wei. For J, the
+            # Carter-Tracy influx rate per unit drawdown is B'*(dt_D/dt)/p_D,
+            # evaluated at the end of the record.
+            loc["Wei_mmbbl"] = a_col * pi / 1.0e6
+            td_end = np.maximum(span * b_col, 1e-8)
+            loc["J_bbl_d_psi"] = (a_col * b_col
+                                  / np.maximum(_pd_edwardson(td_end)[0], 1e-12))
     # Thresholding off the profile's own minimum keeps the band self-consistent
     # even where the profile cannot quite reach the global optimum.
     if len(loc):
@@ -5909,6 +5931,19 @@ def run_self_tests(verbose: bool = True) -> bool:
           f"{ct['G_mmscf']:,.0f} MMscf against a truth of {G_ct / 1e6:,.0f} "
           f"- it inflates Wei to {fk_on_ct['Wei_mmbbl']:,.0f} MMbbl to make "
           "the early influx a pseudo-steady law cannot produce")
+    # A consumer keyed on these names - a chart, an export, a spreadsheet -
+    # must not break the day a third aquifer model arrives. This is the
+    # contract, asserted rather than assumed.
+    LOCUS_CONTRACT = {"G_mmscf", "rms_pct", "Wei_mmbbl", "J_bbl_d_psi"}
+    check("every aquifer locus carries the same stable columns",
+          all(LOCUS_CONTRACT <= set(f["locus"].columns)
+              and bool(np.all(np.isfinite(f["locus"][list(LOCUS_CONTRACT)])))
+              for f in (ct, fk_on_ct, fk) if f is not None and len(f["locus"])),
+          "G, rms, Wei and J present and finite for every model")
+    check("each model also carries its own native parameters",
+          {"Wei_bbl", "tau_days"} <= set(fk["locus"].columns)
+          and {"Bprime_bbl_psi", "td_scale_per_day"} <= set(ct["locus"].columns),
+          "Fetkovich (Wei, tau) and Carter-Tracy (B', t_D scale)")
     check("the aquifer locus always contains its own best fit",
           all(f["g_range_mmscf"][0] * 0.999 <= f["G_mmscf"]
               <= f["g_range_mmscf"][1] * 1.001
