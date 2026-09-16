@@ -366,12 +366,20 @@ def chart_pz(res, theme: str = "light", height: int = 380) -> go.Figure:
         customdata=mb.pressure,
         hovertemplate=("Gp %{x:,.0f} MMscf<br>p/z %{y:,.0f} psia<br>"
                        "p %{customdata:,.0f} psia<extra></extra>")))
-    xs = np.array([0.0, mb.ogip_mmscf])
-    fig.add_trace(go.Scatter(
-        x=xs, y=mb.pz_i * (1 - xs / mb.ogip_mmscf), mode="lines",
-        name=f"OGIP = {mb.ogip_mmscf:,.0f} MMscf",
-        line=dict(width=2.4, color=c["series"][1]),
-        hovertemplate="%{y:,.0f} psia<extra></extra>"))
+    if np.isfinite(mb.ogip_mmscf) and mb.ogip_mmscf > 0:
+        xs = np.array([0.0, mb.ogip_mmscf])
+        fig.add_trace(go.Scatter(
+            x=xs, y=mb.pz_i * (1 - xs / mb.ogip_mmscf), mode="lines",
+            name=f"OGIP = {mb.ogip_mmscf:,.0f} MMscf",
+            line=dict(width=2.4, color=c["series"][1]),
+            hovertemplate="%{y:,.0f} psia<extra></extra>"))
+    else:
+        # No intercept to draw. The points still carry the story, and an
+        # annotation is more use than a missing trace nobody can explain.
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.02, y=0.06, showarrow=False,
+            align="left", font=dict(size=12, color=c["critical"]),
+            text="p/z does not decline — no straight-line OGIP")
     if mb.ogip_single_phase:
         pz_sp = mb.pressure / res.pvt.z(mb.pressure)
         fig.add_trace(go.Scatter(

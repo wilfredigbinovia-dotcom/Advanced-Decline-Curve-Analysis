@@ -1303,7 +1303,7 @@ with tabs[3]:
             show_df(surv, hide_index=True)
     else:
         truth = st.session_state.get("truth_ogip", {}).get(sel)
-        if truth:
+        if truth and np.isfinite(res.matbal.ogip_mmscf):
             k = st.columns(3)
             k[0].metric("True OGIP (simulated)", f"{truth:,.0f} MMscf")
             k[1].metric("Recovered by material balance",
@@ -1319,7 +1319,9 @@ with tabs[3]:
                  "balance recovers and what the single-phase shortcut costs.")
         mb = res.matbal
         k = st.columns(6)
-        k[0].metric("OGIP (p/z line)", f"{mb.ogip_mmscf:,.0f} MMscf",
+        k[0].metric("OGIP (p/z line)",
+                    f"{mb.ogip_mmscf:,.0f} MMscf"
+                    if np.isfinite(mb.ogip_mmscf) else "no intercept",
                     f"R² {mb.r2:.3f}", delta_color="off",
                     help="The straight-line intercept, always. This tile is "
                          "the p/z diagnostic and does not follow the cap "
@@ -1345,6 +1347,25 @@ with tabs[3]:
                              "the sidebar.")
         else:
             k[5].metric("Forecast cap", "none", delta_color="off")
+
+        if np.isfinite(mb.ogip_mmscf) and mb.ogip_mmscf > 0 and np.isfinite(
+                mb.ogip_stderr):
+            _rse = mb.ogip_stderr / mb.ogip_mmscf
+            if _rse > dca.PZ_MAX_REL_SE:
+                warn(f"<b>The p/z intercept is not a usable number.</b> It "
+                     f"reads {mb.ogip_mmscf:,.0f} MMscf ± "
+                     f"{100 * _rse:,.0f} % — a big number divided by a slope "
+                     "that is nearly zero. A line this flat has no meaningful "
+                     "x-intercept, so it is excluded from the forecast cap "
+                     "and should not be quoted. The ceiling and the aquifer "
+                     "fit are the numbers to read here.")
+
+        if mb.pz_note:
+            warn(f"<b>No straight-line OGIP.</b> {mb.pz_note[0].upper()}"
+                 f"{mb.pz_note[1:]}<br>Everything else on this tab still "
+                 "applies: F/Eg, the We ≥ 0 ceiling, the apparent-G sequence "
+                 "and the Fetkovich fit need no straight line, and they are "
+                 "the right instruments when the pressure is being held up.")
 
         if np.isfinite(mb.p_initial):
             src = ("as entered in the sidebar" if mb.p_initial_known else

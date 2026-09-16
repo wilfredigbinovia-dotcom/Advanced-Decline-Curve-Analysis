@@ -2071,6 +2071,8 @@ class MaterialBalanceResult:
     n_surveys: int = 0
     n_skipped: int = 0
     fetkovich: Optional[Dict] = None
+    pz_trend_ok: bool = True            # did the straight line decline at all
+    pz_note: str = ""                   # why there is no intercept, when there isn't
 
     @property
     def volumetric(self) -> bool:
@@ -2092,9 +2094,13 @@ class MaterialBalanceResult:
                  + ("(as entered)" if self.p_initial_known
                     else "(extrapolated to zero cumulative)"),
                  f"  (p/z)_i           : {self.pz_i:,.1f} psia",
-                 f"  OGIP (p/z line)   : {self.ogip_mmscf:,.0f} MMscf "
-                 f"+/- {self.ogip_stderr:,.0f}",
+                 (f"  OGIP (p/z line)   : {self.ogip_mmscf:,.0f} MMscf "
+                  f"+/- {self.ogip_stderr:,.0f}" if self.pz_trend_ok else
+                  "  OGIP (p/z line)   : not available - the trend does not "
+                  "decline"),
                  f"  R2                : {self.r2:.4f}"]
+        if self.pz_note:
+            lines.append(f"  NOTE              : {self.pz_note}")
         if np.isfinite(self.ho_rise):
             lines.append(f"  F/Eg rise         : {self.ho_rise:.2f}x  -> {self.drive}")
         if np.isfinite(self.g_ceiling_mmscf):
@@ -2102,7 +2108,7 @@ class MaterialBalanceResult:
                          "= min(F/Eg)")
         if np.isfinite(self.g_bound_mmscf):
             lines.append(f"  smallest apparent G: {self.g_bound_mmscf:,.0f} MMscf")
-        if self.ogip_single_phase is not None:
+        if self.ogip_single_phase is not None and np.isfinite(self.ogip_mmscf):
             diff = 100.0 * (self.ogip_single_phase / self.ogip_mmscf - 1.0)
             lines.append(f"  OGIP if single-phase z used : "
                          f"{self.ogip_single_phase:,.0f} MMscf ({diff:+.1f} %)")
@@ -2285,9 +2291,26 @@ def material_balance_pz(pressure: np.ndarray,
     z = pvt.z_two_phase(p, method=method) if two_phase else pvt.z(p)
     pz = p / z
     res = stats.linregress(g, pz)
-    if res.slope >= 0:
-        raise ValueError("p/z trend is not declining; check pressure data or units.")
-    ogip = -res.intercept / res.slope
+    # A p/z trend that is flat or rising used to abort the whole calculation.
+    # That is backwards. On a strongly supported reservoir the pressure really
+    # does hold up or recover, so a non-declining trend is a RESULT - and the
+    # parts of this function that matter most in exactly that case (Havlena-
+    # Odeh, the We >= 0 ceiling, the apparent-G sequence, and the Fetkovich fit
+    # downstream) need no straight line at all. Only the intercept-based OGIP
+    # is unavailable, so only that is withheld.
+    pz_trend_ok = bool(res.slope < 0)
+    pz_note = ""
+    if not pz_trend_ok:
+        dp = float(p[-1] - p[0])
+        pz_note = (
+            f"p/z does not decline with cumulative production: over "
+            f"{float(g[-1] - g[0]):,.0f} MMscf the surveys move "
+            f"{dp:+,.0f} psi ({float(pz[-1] - pz[0]):+,.0f} on p/z). No "
+            "straight-line OGIP exists, so it is not reported. If the "
+            "pressures and units are right, this is strong pressure support "
+            "and the material balance has to be read from F/Eg, the ceiling "
+            "and the aquifer fit instead.")
+    ogip = -res.intercept / res.slope if pz_trend_ok else float("nan")
     # Propagate the two regression uncertainties (they are correlated; this is
     # the standard first-order approximation and is adequate for screening).
     rel = math.hypot(res.intercept_stderr / max(abs(res.intercept), 1e-12),
@@ -2321,8 +2344,23 @@ def material_balance_pz(pressure: np.ndarray,
 
     # -- Havlena-Odeh ------------------------------------------------------
     pi_known = p_initial is not None and np.isfinite(p_initial) and p_initial > 0
-    pi = float(p_initial) if pi_known else float(
-        pvt.pressure_from_pz(np.array([res.intercept]), two_phase=two_phase)[0])
+    if pi_known:
+        pi = float(p_initial)
+    else:
+        # With a flat or rising trend the intercept sits below the data, which
+        # would put initial pressure under a pressure that was measured. The
+        # reference then falls back to the highest survey - still wrong, but
+        # wrong in the direction that understates G rather than inventing a
+        # reservoir that was never at that pressure.
+        pi = float(pvt.pressure_from_pz(np.array([res.intercept]),
+                                        two_phase=two_phase)[0]) \
+            if pz_trend_ok else float("nan")
+        if not (np.isfinite(pi) and pi >= float(np.max(p))):
+            pi = float(np.max(p))
+            if not pz_trend_ok:
+                pz_note += (" The reference pressure has been taken as the "
+                            f"highest survey ({pi:,.0f} psia); supply a real "
+                            "initial pressure to make F/Eg meaningful.")
 
     ho = havlena_odeh_gas(p, g, pvt, pi, water_mstb=w, two_phase=two_phase,
                           method=method, include_efw=include_efw, sw=sw,
@@ -2361,6 +2399,7 @@ def material_balance_pz(pressure: np.ndarray,
         r2=float(res.rvalue ** 2), pz_i=float(res.intercept),
         method=("two-phase z" if two_phase else "single-phase z"),
         pressure=p, gp=g, pz=pz, ogip_single_phase=ogip_sp, drive_note=note,
+        pz_trend_ok=pz_trend_ok, pz_note=pz_note,
         ho_table=ho, ho_rise=ho_rise, g_ceiling_mmscf=ceiling,
         g_bound_mmscf=g_bound, drive=drive, impossible=impossible,
         p_initial=pi, p_initial_known=bool(pi_known), gp_now=gp_now,
@@ -2698,6 +2737,7 @@ def estimate_initial_pressure_from_wells(
 # ------------------------------------------------------------------------------
 
 CEILING_SLACK = 1.05        # how far above min(F/Eg) a cap may sit before clipping
+PZ_MAX_REL_SE = 0.50        # above this the p/z intercept is too loose to cap with
 
 
 @dataclass
@@ -2766,16 +2806,28 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
     pz = float(matbal.ogip_mmscf)
     fk = matbal.fetkovich or None
     fk_g = float(fk["G_mmscf"]) if fk else float("nan")
-    cands = {"p/z line": pz}
+    cands = {}
+    if np.isfinite(pz):
+        cands["p/z line"] = pz
     if np.isfinite(ceil):
         cands["We>=0 ceiling"] = ceil
     if np.isfinite(fk_g):
         cands["Fetkovich"] = fk_g
 
+    # A p/z line so nearly flat that its intercept is meaningless still has a
+    # finite intercept. Dividing a big number by a slope that is almost zero
+    # gave a 3 Tcf "gas in place" on a well that has produced 19 Bscf - a
+    # figure that is useless as a cap and actively misleading as a headline.
+    # The regression's own standard error says when that has happened.
+    pz_rel_se = float("inf")
+    if np.isfinite(matbal.ogip_stderr) and np.isfinite(pz) and pz > 0:
+        pz_rel_se = float(matbal.ogip_stderr) / pz
+    pz_usable = bool(np.isfinite(pz) and pz > 0
+                     and pz_rel_se <= PZ_MAX_REL_SE)
+
     def _sigma_pz() -> float:
-        se = float(matbal.ogip_stderr)
-        if np.isfinite(se) and np.isfinite(pz) and pz > 0:
-            return float(np.clip(se / pz, 0.05, 0.50))
+        if np.isfinite(pz_rel_se):
+            return float(np.clip(pz_rel_se, 0.05, 0.50))
         return 0.15
 
     def _sigma_fk() -> float:
@@ -2786,6 +2838,18 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
         return 0.25
 
     if mode in ("p/z", "pz", "p/z line"):
+        if not np.isfinite(pz):
+            return OGIPChoice(reason="The p/z line was requested but the trend "
+                                     "does not decline, so it has no "
+                                     "intercept; the forecast is not capped.",
+                              candidates=cands)
+        if not pz_usable:
+            return OGIPChoice(
+                reason=(f"The p/z line was requested but its intercept is "
+                        f"{pz:,.0f} MMscf +/- {100 * pz_rel_se:.0f} %, which "
+                        "is not a number anything should be held to; the "
+                        "forecast is not capped."),
+                candidates=cands)
         pick, src, sig = pz, "p/z line", _sigma_pz()
         why = "Chosen explicitly."
     elif mode in ("fetkovich", "aquifer"):
@@ -2807,7 +2871,8 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
     else:
         volumetric = (matbal.drive == "volumetric"
                       and not matbal.impossible
-                      and not matbal.ogip_exceeds_ceiling)
+                      and not matbal.ogip_exceeds_ceiling
+                      and pz_usable)
         fk_usable = bool(
             fk and np.isfinite(fk_g) and fk_g > 0
             and float(fk.get("rms_pct", 1e9)) < 5.0)
@@ -2818,22 +2883,39 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
                    "an artefact of pressure support.")
         elif fk_usable:
             pick, src, sig = fk_g, "Fetkovich", _sigma_fk()
-            why = (f"The drive reads {matbal.drive} (F/Eg rises "
-                   f"{matbal.ho_rise:.2f}x), so the p/z intercept "
-                   f"({pz:,.0f} MMscf) is inflated by influx. The Fetkovich "
-                   f"fit models that influx explicitly and matches the "
-                   f"pressure history to {float(fk['rms_pct']):.2f} %.")
+            drive_bit = (f"The drive reads {matbal.drive} (F/Eg rises "
+                         f"{matbal.ho_rise:.2f}x)"
+                         if np.isfinite(matbal.ho_rise) else
+                         "F/Eg could not be evaluated - no survey is far "
+                         "enough into depletion for Eg to mean anything - so "
+                         "the drive is undiagnosed")
+            pz_bit = (f"the p/z intercept ({pz:,.0f} MMscf) cannot be trusted"
+                      if np.isfinite(pz) else "there is no p/z intercept")
+            why = (f"{drive_bit}, and {pz_bit}. The Fetkovich fit models the "
+                   "influx explicitly and matches the pressure history to "
+                   f"{float(fk['rms_pct']):.2f} %.")
         elif np.isfinite(ceil):
             pick, src, sig = ceil, "We>=0 ceiling", 0.10
-            why = (f"The drive reads {matbal.drive} and no usable aquifer fit "
-                   "is available, so the cap falls back to the hard bound "
+            why = (f"The drive reads {matbal.drive} and no usable aquifer "
+                   "fit is available, so the cap falls back to the hard bound "
                    "min(F/Eg), which holds whatever the influx turns out to "
                    "be.")
-        else:
+        elif pz_usable:
             pick, src, sig = pz, "p/z line", _sigma_pz()
             why = ("Neither the ceiling nor an aquifer fit could be evaluated, "
                    "so the p/z intercept is all there is. Treat the cap as "
                    "indicative.")
+        else:
+            return OGIPChoice(
+                reason=(f"Nothing here is fit to cap a forecast: the drive "
+                        f"reads {matbal.drive}, there is no usable aquifer "
+                        "fit, F/Eg gives no ceiling, and the p/z intercept "
+                        + (f"is {pz:,.0f} MMscf +/- {100 * pz_rel_se:.0f} %"
+                           if np.isfinite(pz) else "does not exist")
+                        + ". The forecast runs uncapped, which is the honest "
+                        "outcome - supply an initial pressure, or more "
+                        "surveys, to get a bound."),
+                candidates=cands)
 
     # min(F/Eg) is a minimum over surveys, so scatter biases it low: on clean
     # synthetic data it lands within 2 % of the true G, and real surveys are
@@ -4037,8 +4119,9 @@ def plot_diagnostics(res: WellResult, path: Optional[str] = None,
     a.semilogy(fc["Gp_wellstream_mmscf"], fc["q_wellstream_mscfd"], "-", lw=2.0,
                color=C[1], label="Forecast", zorder=4)
     if res.matbal is not None:
-        a.axvline(res.matbal.ogip_mmscf, color=C[3], lw=1.4, ls="--",
-                  label="OGIP (material balance)", zorder=2)
+        if np.isfinite(res.matbal.ogip_mmscf):
+            a.axvline(res.matbal.ogip_mmscf, color=C[3], lw=1.4, ls="--",
+                      label="OGIP (material balance)", zorder=2)
     a.legend(frameon=False, fontsize=8, labelcolor=PALETTE["ink2"])
 
     # 3 -- loss-ratio diagnostic (declining period only: D is ~0 on plateau,
@@ -4096,9 +4179,11 @@ def plot_diagnostics(res: WellResult, path: Optional[str] = None,
         mb = res.matbal
         a.plot(mb.gp, mb.pz, "o", ms=5, color=C[0], mec=PALETTE["surface"],
                mew=0.8, label="Two-phase z", zorder=3)
-        xs = np.array([0.0, mb.ogip_mmscf])
-        a.plot(xs, mb.pz_i * (1 - xs / mb.ogip_mmscf), "-", lw=2.0, color=C[1],
-               label=f"OGIP = {mb.ogip_mmscf:,.0f} MMscf", zorder=4)
+        if np.isfinite(mb.ogip_mmscf) and mb.ogip_mmscf > 0:
+            xs = np.array([0.0, mb.ogip_mmscf])
+            a.plot(xs, mb.pz_i * (1 - xs / mb.ogip_mmscf), "-", lw=2.0,
+                   color=C[1], label=f"OGIP = {mb.ogip_mmscf:,.0f} MMscf",
+                   zorder=4)
         if mb.ogip_single_phase:
             pz_sp = mb.pressure / res.pvt.z(mb.pressure)
             a.plot(mb.gp, pz_sp, "s", ms=4, color=C[4], mec="none", alpha=0.75,
@@ -4596,6 +4681,52 @@ def run_self_tests(verbose: bool = True) -> bool:
           fk0 is not None and fk0["We_mmbbl"] < 0.5
           and abs(fk0["G_mmscf"] / 55_000 - 1) < 0.02,
           f"We {fk0['We_mmbbl']:.3f} MMbbl, G {fk0['G_mmscf']:,.0f} MMscf")
+
+    # 9c2 -- a p/z that does not decline is a result, not a crash
+    # Strong support can hold the pressure flat or push it back up. The
+    # straight line has no intercept then, but F/Eg, the ceiling, the
+    # apparent-G sequence and the aquifer fit all still work - and they are
+    # exactly the instruments that matter in that case.
+    # An aquifer that has caught up: the surveys start well into depletion and
+    # then recover, ending ABOVE where they started while staying far below
+    # p_i. Real wells do this, and it is precisely the case where the straight
+    # line has nothing to offer and the ceiling has everything.
+    gp_up = np.linspace(0.20 * G, 0.60 * G, 12)
+    p_up = pvt_cvd.pressure_from_pz(pz_i * np.linspace(0.62, 0.70, 12))
+    try:
+        mb_flat = material_balance_pz(p_up, gp_up, pvt_cvd, p_initial=pi)
+        flat_ok = (not mb_flat.pz_trend_ok) and bool(mb_flat.pz_note) \
+            and not np.isfinite(mb_flat.ogip_mmscf) \
+            and np.isfinite(mb_flat.g_ceiling_mmscf) \
+            and mb_flat.drive == "water drive" and len(mb_flat.ho_table) >= 3
+        detail = (f"trend_ok={mb_flat.pz_trend_ok}, OGIP="
+                  f"{mb_flat.ogip_mmscf:,.0f}, drive={mb_flat.drive}, "
+                  f"ceiling {mb_flat.g_ceiling_mmscf:,.0f} MMscf, "
+                  f"{len(mb_flat.ho_table)} H-O rows")
+    except Exception as exc:
+        flat_ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+    check("a non-declining p/z is diagnosed, not raised", flat_ok, detail)
+    check("no intercept means no cap rather than a nonsense cap",
+          not np.isfinite(select_ogip(mb_flat, mode="p/z").value)
+          and select_ogip(mb_flat).source in ("Fetkovich", "We>=0 ceiling"),
+          f"auto falls back to {select_ogip(mb_flat).source}")
+
+    # A nearly flat line still HAS an intercept - an enormous one, from a big
+    # number over a slope near zero. It must not be allowed to cap anything.
+    gp_loose = np.linspace(0.20 * G, 0.34 * G, 7)
+    p_loose = pvt_cvd.pressure_from_pz(
+        pz_i * (np.linspace(0.70, 0.699, 7) + np.array(
+            [0, .004, -.004, .003, -.003, .002, -.002])))
+    mb_loose = material_balance_pz(p_loose, gp_loose, pvt_cvd)
+    rel_se = (mb_loose.ogip_stderr / mb_loose.ogip_mmscf
+              if np.isfinite(mb_loose.ogip_mmscf) and mb_loose.ogip_mmscf > 0
+              else float("nan"))
+    check("an intercept from a near-flat line is refused as a cap",
+          (not np.isfinite(mb_loose.ogip_mmscf))
+          or rel_se > PZ_MAX_REL_SE
+          and not np.isfinite(select_ogip(mb_loose, mode="p/z").value),
+          f"OGIP {mb_loose.ogip_mmscf:,.0f} MMscf +/- {100 * rel_se:.0f} %, "
+          f"cap = {select_ogip(mb_loose, mode='p/z').value}")
 
     # 9d1 -- the forecast cap is chosen by drive, not fixed on the p/z line
     ho_cap = material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi)
