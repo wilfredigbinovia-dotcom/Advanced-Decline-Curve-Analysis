@@ -116,6 +116,10 @@ from scipy.interpolate import interp1d
 #   v2  dates fixed to ISO YYYY-MM-DD rather than guessed; the estimated-p_i
 #       row dated to the start of a month; a non-declining p/z diagnosed
 #       instead of aborting the material balance.
+#  v10  the estimated initial pressure is written into p_res on the FIRST row
+#       of the data rather than onto a row of its own ahead of it. Undo takes
+#       it back out, a measured first-row pressure is never overwritten, and a
+#       row left by the previous behaviour is migrated.
 #   v9  the aquifer locus always carries Wei and J whatever the model's own
 #       parameters are called, so a consumer keyed on those names survives a
 #       new model arriving; asserted by a contract self-test.
@@ -139,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "9.0"
+__version__ = "10.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",

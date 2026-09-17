@@ -29,7 +29,7 @@ import math
 import os
 import sys
 import traceback
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -266,7 +266,12 @@ def align_to_paste_columns(df: pd.DataFrame) -> pd.DataFrame:
     Column names go through the same alias matcher the file loader uses, so a
     block headed `Gas Rate (Mscf/d)` lands in `q_gas` rather than being lost.
     """
-    d = dca.map_columns(df).copy()
+    # reset_index matters: `out` is built on a fresh RangeIndex, so assigning
+    # a column that still carries the caller's index makes pandas align on it
+    # and silently fill NaN wherever the two disagree. Any frame that has been
+    # filtered - a row dropped, rows reordered - arrives here with gaps in its
+    # index and loses its first rows to that alignment.
+    d = dca.map_columns(df).copy().reset_index(drop=True)
     out = pd.DataFrame(index=range(len(d)))
     for c in PASTE_COLUMNS:
         if c in ("date", "well"):
@@ -378,16 +383,34 @@ def date_format_stop(exc: "dca.DateFormatError") -> None:
     st.stop()
 
 
-def prepend_initial_pressure_row(frame: pd.DataFrame,
-                                 p_initial: float) -> pd.DataFrame:
-    """Write an estimated p_i into the grid as a survey at zero cumulative.
+def write_initial_pressure(frame: pd.DataFrame, p_initial: float,
+                           ours: Optional[float] = None,
+                           clear: bool = False) -> Tuple[pd.DataFrame, str]:
+    """Put the estimated p_i on the FIRST row of the data, in `p_res`.
 
-    It goes in as its own row dated the day before first production rather
-    than into the first producing month's `p_res`, because those are different
-    quantities: the first month's cell means "pressure once that month's gas
-    had been produced", and the whole point of the estimate is the pressure
-    BEFORE any of it was. A row of its own is also visible and deletable,
-    which a number quietly dropped into an existing cell is not.
+    Strictly the two are not the same quantity - `p_res` on the first row means
+    the pressure once that row's gas had been produced, and the estimate is the
+    pressure before any of it was. The gap is one period's cumulative, which on
+    a monthly history is a fraction of a percent of gas in place: on the worked
+    well it moved the p/z intercept by 0.14 % and the We >= 0 ceiling not at
+    all. The material balance reference is set separately and explicitly from
+    the sidebar, so nothing downstream depends on this cell being at exactly
+    zero cumulative.
+
+    Against that, a value written into the row the data already has is easier
+    to see, easier to edit and easier to delete than an extra row appearing
+    above the record - which is the whole reason for preferring it.
+
+    A first row that ALREADY carries a pressure is never overwritten. That is
+    a measurement, and the estimator would not have offered in the first place
+    if the record began with one. The one exception is a value this app wrote
+    itself: pass it as `ours` and it is replaced, so re-estimating updates the
+    cell instead of refusing it. `clear` blanks that same cell, which is what
+    Undo needs - otherwise the estimate stays in the table after being
+    withdrawn from everywhere else.
+
+    Returns the frame and one of: "written", "cleared", "kept_existing",
+    "no_rows".
     """
     fr = align_to_paste_columns(frame) if not set(PASTE_COLUMNS) <= set(
         frame.columns) else frame.copy()
@@ -395,36 +418,33 @@ def prepend_initial_pressure_row(frame: pd.DataFrame,
         dates = dca.parse_dates(fr["date"])
     except dca.DateFormatError:
         dates = pd.Series(pd.NaT, index=fr.index, dtype="datetime64[ns]")
-    if dates.notna().any():
-        first = dates.min()
-        # Production data is stamped on the first of the month, so the row
-        # carrying p_i belongs on the first of a month too: 2012-04-01 ahead of
-        # first gas in May 2012, not 2012-04-30. A month-end stamp in a
-        # first-of-month column reads as a different kind of record and sorts
-        # oddly next to its neighbours. MonthBegin rolls back to the start of
-        # the previous month from a month start, and to the start of the
-        # current month from any other day - either way it lands before first
-        # production, where the cumulative is zero.
-        new_date = (first - pd.offsets.MonthBegin(1)).strftime("%Y-%m-%d")
-        well = ""
-        first_rows = fr.loc[dates == first, "well"]
-        if len(first_rows):
-            well = str(first_rows.iloc[0] or "")
-    else:
-        new_date, well = "", ""
+    if not dates.notna().any():
+        return align_to_paste_columns(fr), "no_rows"
 
-    # Replace a previous estimate rather than stacking another one on top.
-    keep = ~((dates.notna()) & (dates == dates.min())
-             & (pd.to_numeric(fr["q_gas"], errors="coerce").fillna(0) <= 0)
-             & (pd.to_numeric(fr["p_res"], errors="coerce").notna())
-             ) if dates.notna().any() else pd.Series(True, index=fr.index)
-    fr = fr[keep]
+    # Clear out an estimate written by an older version of this app, which put
+    # it on a row of its own dated before first gas. Left in place it would sit
+    # there as a duplicate of the value about to be written below.
+    gas = pd.to_numeric(fr["q_gas"], errors="coerce").fillna(0.0)
+    pres = pd.to_numeric(fr["p_res"], errors="coerce")
+    legacy = dates.notna() & (dates == dates.min()) & (gas <= 0) & pres.notna()
+    if legacy.any() and int((~legacy).sum()) > 0:
+        fr = fr[~legacy].reset_index(drop=True)
+        dates = dates[~legacy].reset_index(drop=True)
+        pres = pd.to_numeric(fr["p_res"], errors="coerce")
 
-    row = {c: np.nan for c in PASTE_COLUMNS}
-    row.update({"date": new_date, "well": well, "days_on": 0.0,
-                "p_res": float(p_initial)})
-    out = pd.concat([pd.DataFrame([row]), fr], ignore_index=True)
-    return align_to_paste_columns(out)
+    first_idx = dates.idxmin()
+    current = float(pres.get(first_idx, np.nan))
+    is_ours = (ours is not None and np.isfinite(current)
+               and abs(current - float(ours)) < 1e-6)
+    if clear:
+        if is_ours:
+            fr.loc[first_idx, "p_res"] = np.nan
+            return align_to_paste_columns(fr), "cleared"
+        return align_to_paste_columns(fr), "kept_existing"
+    if np.isfinite(current) and not is_ours:
+        return align_to_paste_columns(fr), "kept_existing"
+    fr.loc[first_idx, "p_res"] = float(p_initial)
+    return align_to_paste_columns(fr), "written"
 
 
 @st.cache_resource(show_spinner=False)
@@ -986,7 +1006,19 @@ if source == "Paste data":
     if st.session_state.pop("_clear_grid", False):
         st.session_state.pop("paste_editor", None)
         st.session_state["paste_frame"] = blank_paste_frame()
+    _clear_pi = st.session_state.pop("_stage_grid_clear", None)
     _pending_pi = st.session_state.pop("_stage_grid_pi", None)
+    if _clear_pi is not None:
+        base_fr = st.session_state.get("_paste_current")
+        if base_fr is None:
+            base_fr = st.session_state.get("paste_frame", blank_paste_frame())
+        try:
+            _fr, _ = write_initial_pressure(base_fr, 0.0, ours=float(_clear_pi),
+                                            clear=True)
+            st.session_state["paste_frame"] = _fr
+            st.session_state.pop("paste_editor", None)
+        except Exception:
+            pass
     if _pending_pi is not None:
         # The editor's live contents, stashed on the previous run: rebuilding
         # from `paste_frame` alone would silently undo anything typed since.
@@ -994,9 +1026,20 @@ if source == "Paste data":
         if base_fr is None:
             base_fr = st.session_state.get("paste_frame", blank_paste_frame())
         try:
-            st.session_state["paste_frame"] = prepend_initial_pressure_row(
-                base_fr, float(_pending_pi))
+            _fr, _status = write_initial_pressure(
+                base_fr, float(_pending_pi),
+                ours=st.session_state.get("_pi_written"))
+            st.session_state["paste_frame"] = _fr
             st.session_state.pop("paste_editor", None)
+            if _status == "written":
+                st.session_state["_pi_written"] = float(_pending_pi)
+            if _status == "kept_existing":
+                st.warning(
+                    "The first row of the table already carries a reservoir "
+                    "pressure, so it was left alone — that is a measurement, "
+                    "and the estimate does not belong on top of it. The "
+                    "estimate is still applied to the fluid definition and to "
+                    "the material balance reference.")
         except Exception as exc:
             st.warning(f"The estimate could not be written into the table "
                        f"({exc}). It is still applied to the fluid definition.")
@@ -1240,7 +1283,7 @@ def pi_dialog(e) -> None:
     pi_body(e)
     st.caption("Accepting writes the estimate into the fluid definition, uses "
                "it as the material balance reference at zero cumulative, and "
-               "adds it to the table as a survey dated before first gas.")
+               "puts it in the `p_res` cell on the first row of the table.")
     a, b = st.columns(2)
     if a.button("Estimate it", type="primary", width="stretch"):
         apply_pi(e.p_initial)
@@ -1255,11 +1298,19 @@ applied = st.session_state.get("_pi_applied")
 if applied is not None:
     c1, c2 = st.columns([5, 1])
     c1.success(
-        f"**Initial pressure estimated at {applied:,.0f} psia** and applied to "
-        "the fluid definition, the material balance reference and the table.")
+        f"**Initial pressure estimated at {applied:,.0f} psia** — applied to "
+        "the fluid definition, used as the material balance reference, and "
+        "written into `p_res` on the first row of the table.")
     if c2.button("Undo", width="stretch"):
         st.session_state["_stage_p_init"] = 6400.0
         st.session_state["_stage_mb_pi"] = 0.0
+        # Withdraw it from the table as well. Leaving the estimate sitting in
+        # p_res after undoing it everywhere else would turn a withdrawn guess
+        # into what looks like a measurement.
+        _w = st.session_state.pop("_pi_written", None)
+        if _w is not None:
+            st.session_state["_stage_grid_clear"] = _w
+            st.session_state["_pi_absorb_sig"] = True
         st.session_state.pop("_pi_applied", None)
         st.rerun()
 elif pi_gap_matters(pi_est):
