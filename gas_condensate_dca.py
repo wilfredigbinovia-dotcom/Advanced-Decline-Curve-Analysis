@@ -98,7 +98,7 @@ import re
 import os
 import sys
 import warnings
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "12.0"
+__version__ = "13.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -4244,6 +4244,25 @@ class WaterTrend:
     n_points: int
     q_last_stbd: float = float("nan")
     t_last_days: float = float("nan")
+    # Regression uncertainty on the trend itself. Without these the Monte
+    # Carlo treats a water forecast fitted to R2 0.61 as if it were known
+    # exactly, and on a well that dies on water that makes the whole EUR
+    # distribution collapse onto the deterministic answer.
+    slope_stderr_per_day: float = float("nan")
+    intercept_stderr: float = float("nan")
+
+    def perturb(self, rng: np.random.Generator) -> "WaterTrend":
+        """One draw from the fitted trend's own regression uncertainty."""
+        if not (np.isfinite(self.slope_stderr_per_day)
+                and np.isfinite(self.intercept_stderr)):
+            return self
+        slope = float(rng.normal(self.slope_per_day,
+                                 self.slope_stderr_per_day))
+        # The intercept is quoted at t = 0, but q0 is quoted at t0, so the
+        # intercept scatter is applied in log space at t0 directly.
+        ln_q0 = math.log(max(self.q0_stbd, 1e-12)) + float(
+            rng.normal(0.0, self.intercept_stderr))
+        return replace(self, q0_stbd=math.exp(ln_q0), slope_per_day=slope)
 
     @property
     def growth_pct_per_year(self) -> float:
@@ -4290,7 +4309,9 @@ def fit_water_trend(t_days: np.ndarray, q_water: np.ndarray,
         slope_per_day=float(res.slope), t0_days=t0,
         r2=float(res.rvalue ** 2), p_value=float(res.pvalue),
         n_points=int(len(t)), q_last_stbd=float(q[-1]),
-        t_last_days=float(t[-1]))
+        t_last_days=float(t[-1]),
+        slope_stderr_per_day=float(res.stderr),
+        intercept_stderr=float(getattr(res, "intercept_stderr", np.nan)))
 
 
 @dataclass
@@ -4668,7 +4689,8 @@ def monte_carlo_eur(fit: FitResult,
                                        t_max_years=t_max_years,
                                        products=products,
                                        ogip_cap_mmscf=cap,
-                                       water_trend=water_trend,
+                                       water_trend=(None if water_trend is None
+                                                    else water_trend.perturb(rng)),
                                        q_water_econ_stbd=q_water_econ_stbd,
                                        water_cut_econ=water_cut_econ)
             except Exception:
@@ -4684,6 +4706,7 @@ def monte_carlo_eur(fit: FitResult,
                 "eur_sales_gas_mmscf": fc.eur_sales_gas_mmscf,
                 "eur_condensate_mstb": fc.eur_condensate_mstb,
                 "life_years": fc.economic_life_years,
+                "ended_by": fc.abandonment_reason,
                 **{f"p_{k}": v for k, v in pars.items()},
             })
 
@@ -4803,6 +4826,28 @@ class WellResult:
                 out.append(f"  {key}")
                 out.append(f"    P90 {st['P90']:>14,.0f} | P50 {st['P50']:>14,.0f} "
                            f"| P10 {st['P10']:>14,.0f}   (n={st['n']})")
+            if self.mc is not None and "ended_by" in self.mc.columns:
+                mix = self.mc["ended_by"].value_counts(normalize=True)
+                out.append("  what ends each realisation: " + ", ".join(
+                    f"{k} {100 * v:.0f} %" for k, v in mix.items()))
+                # A band this tight is not a statement about how well the
+                # reservoir is known - it is a constraint holding every draw
+                # at the same date. Saying so stops it being read as a
+                # reserves range.
+                key = "EUR wellstream gas (MMscf)"
+                st = self.mc_stats.get(key)
+                if st and st["P50"] > 0:
+                    spread = (st["P10"] - st["P90"]) / st["P50"]
+                    top, frac = mix.index[0], float(mix.iloc[0])
+                    if spread < 0.05 and top != "gas rate" and frac > 0.8:
+                        out.append(
+                            f"  NOTE: the P90-P10 spread is only {100*spread:.1f} % "
+                            f"because {100*frac:.0f} % of realisations end on "
+                            f"'{top}' at\n        nearly the same date. This is "
+                            "the spread of the DECLINE fit, not of the "
+                            "reserves.\n        The real uncertainty is the "
+                            f"'{top}' limit itself, which is an input, not a "
+                            "fitted\n        parameter - vary it directly.")
             out.append("")
         text = "\n".join(out)
         print(text, file=stream) if stream is not None else print(text)
