@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "14.0"
+__version__ = "16.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -1444,6 +1444,31 @@ class ProductionData:
         out = src.loc[keep, [c for c in cols if c in src.columns]].copy()
         return out.reset_index(drop=True)
 
+    @property
+    def flowing_tests(self) -> pd.DataFrame:
+        """Producing months carrying a flowing pressure, from the FULL record.
+
+        Same argument as `surveys`, one step further. A flowing pressure is a
+        measurement of the WELL, and the rate QC - which drops short months
+        and rate outliers - has no business deleting it either. On a well
+        whose gauge tends to be run during a workover month or a partial
+        month, the uptime filter can remove most of the pressure record: 8L
+        carries six flowing pressures and the QC left three, which was enough
+        to refuse the bank diagnostic on a well that had the data for it.
+
+        Shut-in months ARE excluded, because a productivity index needs a
+        rate to divide by.
+        """
+        src = self.full_df if self.full_df is not None else self.df
+        cols = ["date", "t", "p_wf", "p_res", "q_ws", "q_gas", "Gp_ws"]
+        if "p_wf" not in src.columns:
+            return pd.DataFrame(columns=cols)
+        pwf = pd.to_numeric(src["p_wf"], errors="coerce")
+        keep = (np.isfinite(pwf) & (pwf > 0)
+                & (pd.to_numeric(src["q_gas"], errors="coerce") > 0))
+        out = src.loc[keep, [c for c in cols if c in src.columns]].copy()
+        return out.reset_index(drop=True)
+
     def window(self, t_min: Optional[float] = None,
                t_max: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
         """Return (t, q_wellstream) restricted to a fitting window."""
@@ -2628,20 +2653,48 @@ class BankDiagnostic:
     r2: float = float("nan")
     p_dew_crossed_days: Optional[float] = None
     reason: str = ""
+    n_points: int = 0
+    p_value: float = float("nan")
+    p_avg_source: str = "material balance"
+
+    @property
+    def indicative(self) -> bool:
+        """Enough points to fit, not enough to quote without a caveat."""
+        return bool(self.ok and 0 < self.n_points < GOOD_BANK_POINTS)
 
     def summary(self) -> str:
         if not self.ok:
             return f"  bank diagnostic   : not run ({self.reason})"
-        return (f"  bank diagnostic   : PI fell {100 * self.loss_frac:,.0f} % "
+        head = (f"  bank diagnostic   : PI fell {100 * self.loss_frac:,.0f} % "
                 f"({self.pi_initial:,.3g} -> {self.pi_final:,.3g}), trend "
-                f"{self.trend_pct_per_year:+,.0f} %/yr (R2 {self.r2:.2f})")
+                f"{self.trend_pct_per_year:+,.0f} %/yr "
+                f"(R2 {self.r2:.2f}, n={self.n_points})\n"
+                f"                      p_avg from {self.p_avg_source}")
+        if self.indicative:
+            head += (f"\n                      INDICATIVE only - {self.n_points} "
+                     f"flowing pressures is below the {GOOD_BANK_POINTS} this "
+                     "wants; read the trend as a\n                      "
+                     "direction, not a measurement")
+            if self.p_avg_source != "measured p_res":
+                head += ("; p_avg is modelled, so it carries\n"
+                         "                      the gas-in-place error with it")
+        return head
+
+
+# Four points span a trend; six make it worth quoting. Below six the fit is
+# reported with an explicit "indicative" flag rather than withheld, because a
+# well with five flowing pressures over twelve years still has something to
+# say and silence was being read as "no bank".
+MIN_BANK_POINTS = 4
+GOOD_BANK_POINTS = 6
 
 
 def bank_diagnostic(t_days: np.ndarray, q_ws: np.ndarray, gp_mmscf: np.ndarray,
                     p_wf: Optional[np.ndarray], pvt: PVT,
                     ogip_mmscf: Optional[float], p_initial: Optional[float],
                     two_phase: bool = True,
-                    t_min: Optional[float] = None) -> BankDiagnostic:
+                    t_min: Optional[float] = None,
+                    p_res: Optional[np.ndarray] = None) -> BankDiagnostic:
     """Track q / [m(p_avg) - m(p_wf)] over the producing history.
 
     Average reservoir pressure comes from the material balance at the chosen
@@ -2667,17 +2720,39 @@ def bank_diagnostic(t_days: np.ndarray, q_ws: np.ndarray, gp_mmscf: np.ndarray,
     q = np.asarray(q_ws, float)
     g = np.asarray(gp_mmscf, float)
     pw = np.asarray(p_wf, float)
-    ok = np.isfinite(t) & np.isfinite(q) & np.isfinite(g) & np.isfinite(pw) \
-        & (q > 0) & (pw > 0)
-    if int(ok.sum()) < 6:
-        return BankDiagnostic(ok=False,
-                              reason="fewer than six periods with a flowing "
-                                     "pressure")
+    have_p = np.isfinite(pw) & (pw > 0)
+    ok = np.isfinite(t) & np.isfinite(q) & np.isfinite(g) & have_p & (q > 0)
+    n_have, n_ok = int(have_p.sum()), int(ok.sum())
+    if n_ok < MIN_BANK_POINTS:
+        # Say what was counted and what was thrown away. "Fewer than six" on a
+        # well that HAS six flowing pressures sends the reader looking for
+        # missing data that is not missing: the usual cause is a gauge read
+        # while the well was shut in, where the index is undefined because
+        # there is no rate to divide.
+        lost = n_have - n_ok
+        detail = (f"{n_have} row(s) carry a flowing pressure but only {n_ok} "
+                  f"also have a rate")
+        if lost > 0:
+            detail += (f"; {lost} was/were recorded at zero rate (shut in), "
+                       "where a productivity index cannot be formed")
+        return BankDiagnostic(
+            ok=False,
+            reason=f"{detail} - {MIN_BANK_POINTS} usable points are needed")
+    # `pr_all` is carried through every mask alongside t/q/g/pw rather than
+    # being sliced separately later - a measured pressure attached to the
+    # wrong row is worse than no measured pressure at all.
+    pr_all = (np.asarray(p_res, float) if p_res is not None else None)
+    if pr_all is not None and len(pr_all) != len(t):
+        pr_all = None
     t, q, g, pw = t[ok], q[ok], g[ok], pw[ok]
+    if pr_all is not None:
+        pr_all = pr_all[ok]
     if t_min is not None and np.isfinite(t_min):
         keep = t >= float(t_min)
-        if int(keep.sum()) >= 6:
+        if int(keep.sum()) >= MIN_BANK_POINTS:
             t, q, g, pw = t[keep], q[keep], g[keep], pw[keep]
+            if pr_all is not None:
+                pr_all = pr_all[keep]
 
     pz_i = float(p_initial) / float(
         pvt.z_two_phase(np.array([float(p_initial)]))[0] if two_phase
@@ -2685,17 +2760,40 @@ def bank_diagnostic(t_days: np.ndarray, q_ws: np.ndarray, gp_mmscf: np.ndarray,
     p_avg = pvt.pressure_from_pz(
         pz_i * (1.0 - np.clip(g / float(ogip_mmscf), 0.0, 0.999)),
         two_phase=two_phase)
+
+    # That relation is a VOLUMETRIC tank: p/z falls in proportion to Gp/G. On
+    # a water-driven reservoir it is wrong twice over - the influx holds the
+    # real pressure up, and the G it is handed came from an aquifer fit, which
+    # is not the G of a depleting tank. On 8L it put p_avg BELOW the measured
+    # flowing pressure in the later years and the diagnostic refused to run,
+    # while the gauge on those very rows read 3,222 psia. So a measured
+    # reservoir pressure on the same row always wins: it is the one number
+    # here that is not downstream of a gas-in-place estimate.
+    src = "material balance"
+    if pr_all is not None:
+        pr = pr_all
+        use = np.isfinite(pr) & (pr > 0) & (pr > pw)
+        if int(use.sum()):
+            p_avg = np.where(use, pr, p_avg)
+            src = ("measured p_res" if use.all() else
+                   f"measured p_res on {int(use.sum())} of {len(use)} points, "
+                   "material balance elsewhere")
+
     dm = pvt.m(p_avg) - pvt.m(pw)
     good = dm > 0
-    if int(good.sum()) < 6:
-        return BankDiagnostic(ok=False,
-                              reason="flowing pressure is not below the "
-                                     "average reservoir pressure")
+    if int(good.sum()) < MIN_BANK_POINTS:
+        return BankDiagnostic(
+            ok=False,
+            reason=f"only {int(good.sum())} point(s) have the flowing "
+                   "pressure below the average reservoir pressure")
     t, q, p_avg, dm = t[good], q[good], p_avg[good], dm[good]
     pi_series = q / dm
 
     res = stats.linregress(t / DAYS_PER_YEAR, np.log(pi_series))
-    n_edge = max(3, len(pi_series) // 10)
+    # The end medians must not overlap. With a long series that means a tenth
+    # at each end; with five points it means one, and taking three would have
+    # compared the series against itself and reported a loss of nearly zero.
+    n_edge = max(1, min(max(3, len(pi_series) // 10), len(pi_series) // 3))
     pi0 = float(np.median(pi_series[:n_edge]))
     pi1 = float(np.median(pi_series[-n_edge:]))
     crossed = None
@@ -2708,7 +2806,9 @@ def bank_diagnostic(t_days: np.ndarray, q_ws: np.ndarray, gp_mmscf: np.ndarray,
         pi_initial=pi0, pi_final=pi1,
         loss_frac=float(1.0 - pi1 / pi0) if pi0 > 0 else float("nan"),
         trend_pct_per_year=float(100.0 * (math.exp(res.slope) - 1.0)),
-        r2=float(res.rvalue ** 2), p_dew_crossed_days=crossed)
+        r2=float(res.rvalue ** 2), p_dew_crossed_days=crossed,
+        n_points=int(len(pi_series)), p_value=float(res.pvalue),
+        p_avg_source=src)
 
 
 @dataclass
@@ -4886,7 +4986,39 @@ class WellResult:
         if self.forecast.water_trend is not None:
             out += ["-- Produced water " + "-" * 60,
                     self.forecast.water_trend.summary(), ""]
-        out += ["-- Deterministic forecast " + "-" * 52, self.forecast.summary(), ""]
+        out += ["-- Deterministic forecast " + "-" * 52, self.forecast.summary()]
+        # The condensate EUR is built from the REPORTED liquid stream. When the
+        # liquid check has already said that stream cannot be condensate, the
+        # number above is a measurement of something else and printing it
+        # unqualified is how a contaminated stream gets booked as reserves.
+        lc = self.liquid_check
+        if lc is not None and lc.exceeds and np.isfinite(lc.implied_non_condensate):
+            clean = 1.0 - float(lc.implied_non_condensate)
+            eur_c = self.forecast.eur_condensate_mstb
+            out += [
+                "  CAVEAT on the condensate EUR",
+                f"    The {eur_c:,.0f} Mstb above is the REPORTED liquid. The "
+                f"liquid check says {100 * (1 - clean):.0f} % of it",
+                "    cannot be condensate from this gas, which puts the "
+                "condensate-only EUR nearer",
+                f"    {eur_c * clean:,.0f} Mstb. Neither number is a reserve "
+                "until the liquid stream is split by",
+                "    laboratory analysis - the split above is inferred from "
+                "the initial CGR, not measured.",
+            ]
+            # The same liquid was converted to gas equivalent and added to the
+            # wellstream, so it has already contaminated the gas EUR and,
+            # through Gp, the material balance behind it.
+            ge = eur_c * (1.0 - clean) * self.pvt.v_eq / 1.0e3   # MMscf
+            eur_g = self.forecast.eur_wellstream_mmscf
+            if eur_g > 0:
+                out.append(
+                    f"    Knock-on: {ge:,.0f} MMscf of the wellstream EUR "
+                    f"({100 * ge / eur_g:.0f} %) is the gas equivalent of that")
+                out.append(
+                    "    same liquid, so the gas in place behind it is "
+                    "overstated by about as much.")
+        out += [""]
         if self.mc_stats:
             out.append("-- Probabilistic EUR (P90 = low case) " + "-" * 40)
             for key, st in self.mc_stats.items():
@@ -5121,11 +5253,24 @@ def analyse_well(df: pd.DataFrame | ProductionData,
         (pd.to_numeric(data.df["q_water"], errors="coerce").to_numpy(float)
          if "q_water" in data.df.columns else np.full(len(data.cgr), np.nan)),
         data.q_cond, gp=data.Gp_ws)
+    # Feed the bank diagnostic from the FULL record, not the rate-QC'd one:
+    # the flowing pressures are measurements of the well and the rate filters
+    # were deleting most of them (see ProductionData.flowing_tests).
+    ft = data.flowing_tests
+    if len(ft) >= MIN_BANK_POINTS:
+        bank_t, bank_q = ft["t"].to_numpy(float), ft["q_ws"].to_numpy(float)
+        bank_g, bank_pwf = ft["Gp_ws"].to_numpy(float), ft["p_wf"].to_numpy(float)
+    else:
+        bank_t, bank_q = data.t, data.q_ws
+        bank_g, bank_pwf = data.Gp_ws, data.p_wf
+    bank_pres = (ft["p_res"].to_numpy(float)
+                 if len(ft) >= MIN_BANK_POINTS and "p_res" in ft.columns
+                 else None)
     bank = bank_diagnostic(
-        data.t, data.q_ws, data.Gp_ws, data.p_wf, pvt,
+        bank_t, bank_q, bank_g, bank_pwf, pvt,
         ogip_choice.value if np.isfinite(ogip_choice.value) else None,
         matbal.p_initial if matbal is not None else pvt.p_init,
-        t_min=t_lo)
+        t_min=t_lo, p_res=bank_pres)
 
     # -- forecast ---------------------------------------------------------
     t_last = float(data.t[-1])
@@ -6320,6 +6465,29 @@ def run_self_tests(verbose: bool = True) -> bool:
           f"{bd.trend_pct_per_year:+,.0f} %/yr after the plateau - on "
           "plateau the choke holds the rate while drawdown shrinks, so the "
           "index rises")
+    # A measured reservoir pressure beats a modelled one, and must be used.
+    # The volumetric p/z relation is wrong on a supported reservoir: it drove
+    # p_avg BELOW the measured flowing pressure on 8L and the diagnostic
+    # refused to run on a well that had five perfectly good drawdown pairs.
+    t_bk = np.array([550.0, 1250.0, 4230.0, 4500.0, 4960.0])
+    q_bk = np.array([8694.0, 8824.0, 4234.0, 4480.0, 4117.0])
+    g_bk = np.array([5105.0, 10978.0, 16929.0, 17371.0, 18931.0])
+    pwf_bk = np.array([3608.5, 3099.1, 2763.7, 2639.3, 2678.1])
+    pres_bk = np.array([3694.7, 3295.0, 3285.6, 3307.3, 3221.7])
+    b_mod = bank_diagnostic(t_bk, q_bk, g_bk, pwf_bk, pvt, 60_308.0, 4_092.0)
+    b_obs = bank_diagnostic(t_bk, q_bk, g_bk, pwf_bk, pvt, 60_308.0, 4_092.0,
+                            p_res=pres_bk)
+    check("a supported reservoir's modelled p_avg can fall below p_wf",
+          not b_mod.ok, b_mod.reason)
+    check("measured reservoir pressures rescue the bank diagnostic",
+          b_obs.ok and b_obs.p_avg_source == "measured p_res"
+          and b_obs.trend_pct_per_year < 0 and b_obs.n_points == 5,
+          f"PI {b_obs.trend_pct_per_year:+.0f} %/yr, R2 {b_obs.r2:.2f}, "
+          f"loss {100 * b_obs.loss_frac:.0f} %")
+    check("a five-point bank fit is flagged indicative, not quoted flat",
+          b_obs.indicative and "INDICATIVE" in b_obs.summary(),
+          "n=5 is below the 6 the diagnostic wants")
+
     check("the bank diagnostic refuses to run without what it needs",
           not bank_diagnostic(d_pi.t, d_pi.q_ws, d_pi.Gp_ws, None, pvt_cvd,
                               52000.0, 6400.0).ok
