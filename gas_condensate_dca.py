@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "23.0"
+__version__ = "24.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -1124,6 +1124,13 @@ class QCReport:
     n_outliers_removed: int = 0
     n_low_uptime_removed: int = 0
     n_pressure_surveys: int = 0
+    # Rows the QC drops are removed from the FIT, but their volumes stay in the
+    # cumulative - deliberately, because Gp is a record of what the well
+    # produced, not of which months were tidy. That means a single bad cell can
+    # inflate Gp, the material balance and the EUR while being invisible in a
+    # report that only counts rows. So the volume is counted too.
+    excluded_gp_mmscf: float = 0.0
+    excluded_gp_frac: float = 0.0
     bdf_start_index: Optional[int] = None
     bdf_start_days: Optional[float] = None
     plateau_end_index: Optional[int] = None
@@ -1140,6 +1147,19 @@ class QCReport:
             f"  rate outliers removed   : {self.n_outliers_removed}",
             f"  low-uptime rows removed : {self.n_low_uptime_removed}",
         ]
+        if self.excluded_gp_mmscf > 0:
+            lines.append(
+                f"  volume in dropped rows  : {self.excluded_gp_mmscf:,.0f} "
+                f"MMscf wellstream ({100 * self.excluded_gp_frac:.1f} % of the "
+                "cumulative)")
+            if self.excluded_gp_frac > 0.10:
+                lines.append(
+                    "  WARNING                 : those rows are excluded from "
+                    "the decline fit but their gas still\n"
+                    "                            counts in Gp, so it feeds the "
+                    "material balance and the EUR.\n"
+                    "                            Check them before trusting "
+                    "either.")
         if self.plateau_end_days is not None:
             lines.append(f"  plateau ends            : day {self.plateau_end_days:.0f}"
                          f" ({self.plateau_end_days / DAYS_PER_YEAR:.2f} yr)")
@@ -1357,6 +1377,17 @@ class ProductionData:
         # is a measurement of the reservoir, not of the rate, so the rate
         # filters have no business removing it.
         full = d.copy()
+        # How much gas sits in the rows about to be dropped. The cumulative is
+        # built from the full record above, on purpose, so this is the part of
+        # Gp that the decline fit never sees but the material balance and the
+        # EUR both rest on.
+        eff_all = d["days_on"].where(d["days_on"] > 0, d["period_days"])
+        vol_all = float(np.sum(d["q_ws"] * eff_all)) / MSCF_PER_MMSCF
+        vol_drop = float(np.sum((d["q_ws"] * eff_all)[~keep_mask])) \
+            / MSCF_PER_MMSCF
+        qc.excluded_gp_mmscf = max(vol_drop, 0.0)
+        qc.excluded_gp_frac = (vol_drop / vol_all) if vol_all > 0 else 0.0
+
         d = d[keep_mask].reset_index(drop=True)
         qc.n_after_screen = len(d)
         if "p_res" in full.columns:
@@ -1689,6 +1720,12 @@ class Arps(DeclineModel):
 
     def time_to_rate(self, q_target, t_max=100 * DAYS_PER_YEAR):
         q_target = float(q_target)
+        # A target of zero (or below) is never reached by a decline that
+        # approaches zero asymptotically. Dividing by it raised
+        # ZeroDivisionError from inside the forecast, which is not a useful
+        # way to say "there is no rate limit".
+        if not np.isfinite(q_target) or q_target <= 0.0:
+            return float("inf")
         if q_target >= self.qi:
             return float(self.t0)
         if self.b < 1e-8:
@@ -1788,6 +1825,8 @@ class ModifiedHyperbolic(DeclineModel):
 
     def time_to_rate(self, q_target, t_max=100 * DAYS_PER_YEAR):
         q_target = float(q_target)
+        if not np.isfinite(q_target) or q_target <= 0.0:
+            return float("inf")
         if q_target >= self.qi:
             return float(self.t0)
         if np.isfinite(self.t_switch) and q_target < self.q_switch:
@@ -4774,8 +4813,13 @@ def forecast_products(fit: FitResult,
 
     # `time_to_rate` measures its own t_max from the fit reference t0, so the
     # span has to be translated out of absolute days before it is passed in.
-    t_ab = model.time_to_rate(
+    # A zero or negative economic rate means "no rate limit" - the well runs to
+    # the horizon or to whichever other constraint binds first. It used to
+    # divide by that zero and raise from the middle of the forecast.
+    rate_limit_on = np.isfinite(q_econ_mscfd) and q_econ_mscfd > 0
+    t_ab = (model.time_to_rate(
         q_econ_mscfd, t_max=max(t_end_max - model.t0, step_days))
+        if rate_limit_on else float("inf"))
     if not np.isfinite(t_ab):
         t_ab = t_end_max
     t_ab = float(min(max(t_ab, t_start_days + step_days), t_end_max))
@@ -4799,8 +4843,9 @@ def forecast_products(fit: FitResult,
     # the well is applied here and the EARLIEST one wins. Each is recorded even
     # when it does not bind, because knowing a well drowns in three years and
     # dies on rate in thirteen is the whole point of looking.
-    reason = "gas rate"
-    constraint_years: Dict[str, float] = {"gas rate": t_ab / DAYS_PER_YEAR}
+    reason = "gas rate" if rate_limit_on else "max forecast life"
+    constraint_years: Dict[str, float] = ({"gas rate": t_ab / DAYS_PER_YEAR}
+                                          if rate_limit_on else {})
     cut_at = len(t)
     # A constraint whose first violation is the FIRST forecast step is not a
     # forecast of anything - the well is already past that limit today. The
@@ -4861,7 +4906,7 @@ def forecast_products(fit: FitResult,
         t, q_ws, gp = t[:keep], q_ws[:keep], gp[:keep]
         q_water = q_water[:keep]
         t_ab = float(t[-1])
-    if t_ab >= t_end_max - 1e-9 and reason == "gas rate":
+    if t_ab >= t_end_max - 1e-9 and reason in ("gas rate", "max forecast life"):
         reason = "max forecast life"
 
     cgr = yield_model(gp)                          # STB/MMscf
@@ -5405,9 +5450,22 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     # -- yield model ------------------------------------------------------
     gp_dew, gp_dew_note = gp_at_dewpoint(data.surveys, pvt.p_dew,
                                          float(data.Gp_ws[-1]))
-    yield_model = fit_yield_model(data.Gp_ws, data.cgr, Gp_dew=gp_dew,
-                                  fit_dewpoint_break=(gp_dew is None))
-    yield_model.gp_dew_note = gp_dew_note
+    try:
+        yield_model = fit_yield_model(data.Gp_ws, data.cgr, Gp_dew=gp_dew,
+                                      fit_dewpoint_break=(gp_dew is None))
+    except Exception as exc:
+        # A well with no reported condensate - a dry-gas completion, or a
+        # stream where the liquid is metered somewhere else - used to take the
+        # WHOLE analysis down with "Need at least 4 valid CGR points". The gas
+        # side of this workflow does not depend on the yield model, so the
+        # right answer is a zero yield and a note, not an exception.
+        warnings.warn(f"[{well}] CGR yield fit skipped: {exc}")
+        yield_model = YieldModel(cgr_i=0.0, cgr_min=0.0, k=1e-9,
+                                 Gp_dew=float(gp_dew or 0.0))
+        yield_model.gp_dew_note = (
+            "no yield model - " + str(exc) + "; condensate is forecast as zero")
+        gp_dew_note = ""
+    yield_model.gp_dew_note = gp_dew_note or yield_model.gp_dew_note
     # The initial CGR is a physical ceiling on the produced ratio, so the
     # yield fit can be checked against it instead of being reported as if the
     # data were beyond question.
@@ -6972,6 +7030,49 @@ def run_self_tests(verbose: bool = True) -> bool:
               and res.mc_stats["EUR wellstream gas (MMscf)"]["P90"]
               <= res.mc_stats["EUR wellstream gas (MMscf)"]["P10"])
         check("end-to-end analysis runs and is self-consistent", ok)
+
+        # Edge cases found by sweeping inputs rather than reading reports.
+        # (a) an economic rate of zero means "no rate limit", not a crash.
+        for cls_z, m_z in (("Arps", Arps(qi=9000.0, Di=1.2e-3, b=0.8)),
+                           ("ModifiedHyperbolic",
+                            ModifiedHyperbolic(
+                                qi=9000.0, Di=1.2e-3, b=0.8,
+                                Dmin=ModifiedHyperbolic
+                                .annual_effective_to_nominal(0.07)))):
+            ok_z = (m_z.time_to_rate(0.0) == float("inf")
+                    and m_z.time_to_rate(-5.0) == float("inf"))
+            check(f"{cls_z}.time_to_rate(0) is infinite, not a divide by zero",
+                  ok_z, "a decline never reaches zero rate")
+        fc_z = analyse_well(df, pvt, well="TEST", verbose=False,
+                            run_monte_carlo=False, q_econ_mscfd=0.0,
+                            t_max_years=15.0).forecast
+        check("a zero economic rate runs to the horizon instead of raising",
+              fc_z.abandonment_reason == "max forecast life"
+              and fc_z.remaining_wellstream_mmscf >= 0,
+              f"ended by {fc_z.abandonment_reason} at "
+              f"{fc_z.forecast_years:.1f} yr of forecast")
+
+        # (b) a well with no reported condensate is a gas well, not an error.
+        df_dry = df.copy()
+        df_dry["q_cond"] = 0.0
+        res_dry = analyse_well(df_dry, pvt, well="DRY", verbose=False,
+                               run_monte_carlo=False)
+        check("a well with no condensate still gets a gas forecast",
+              res_dry.forecast.eur_wellstream_mmscf > 0
+              and abs(res_dry.forecast.eur_condensate_mstb) < 1e-6,
+              "the yield fit is skipped, the gas side is unaffected")
+
+        # (c) rows the QC drops keep their volume in Gp. That is deliberate,
+        # and precisely why it has to be reported: one bad cell can inflate
+        # the cumulative, the material balance and the EUR without changing a
+        # single row count.
+        qcv = res.data.qc
+        check("the volume inside dropped rows is measured, not just the count",
+              qcv.excluded_gp_mmscf >= 0 and 0 <= qcv.excluded_gp_frac <= 1
+              and (qcv.excluded_gp_mmscf == 0
+                   or "volume in dropped rows" in qcv.summary()),
+              f"{qcv.excluded_gp_mmscf:,.0f} MMscf "
+              f"({100 * qcv.excluded_gp_frac:.1f} %)")
 
         # The QC note used to quote the PLATEAU point count as if it were the
         # whole exclusion. When the BDF start lands later than the plateau end
