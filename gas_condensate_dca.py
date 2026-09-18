@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "24.0"
+__version__ = "25.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -1131,6 +1131,8 @@ class QCReport:
     # report that only counts rows. So the volume is counted too.
     excluded_gp_mmscf: float = 0.0
     excluded_gp_frac: float = 0.0
+    n_duplicate_dates: int = 0
+    n_negative_water: int = 0
     bdf_start_index: Optional[int] = None
     bdf_start_days: Optional[float] = None
     plateau_end_index: Optional[int] = None
@@ -1147,6 +1149,12 @@ class QCReport:
             f"  rate outliers removed   : {self.n_outliers_removed}",
             f"  low-uptime rows removed : {self.n_low_uptime_removed}",
         ]
+        if self.n_duplicate_dates:
+            lines.append(f"  duplicate dates dropped : {self.n_duplicate_dates}")
+        if self.n_negative_water:
+            lines.append(
+                f"  negative water readings : {self.n_negative_water} "
+                "(clipped to zero)")
         if self.excluded_gp_mmscf > 0:
             lines.append(
                 f"  volume in dropped rows  : {self.excluded_gp_mmscf:,.0f} "
@@ -1234,6 +1242,25 @@ class ProductionData:
 
         d["date"] = parse_dates(d["date"])
         d = d.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+        # Two rows on the same date are never right for one well, and they do
+        # real damage quietly: the period between them is zero, so the volume
+        # is counted twice, `t` stops increasing, and every cumulative and
+        # trend downstream is built on it. A month pasted twice, or two wells
+        # merged into one group, both land here.
+        dup = d["date"].duplicated(keep="first")
+        if bool(dup.any()):
+            qc.n_duplicate_dates = int(dup.sum())
+            dup_any = d["date"].duplicated(keep=False)
+            differ = (d.loc[dup_any].groupby("date")["q_gas"].nunique() > 1)
+            qc.notes.append(
+                f"{int(dup.sum())} row(s) repeat a date already in the record "
+                "and were dropped; a date can only appear once per well."
+                + (f" {int(differ.sum())} of those dates carried DIFFERENT gas "
+                   "rates, which usually means two wells have been merged into "
+                   "one series - check the grouping before trusting anything "
+                   "below." if bool(differ.any()) else ""))
+            d = d.loc[~dup].reset_index(drop=True)
 
         for col in ("q_gas", "q_cond", "q_water", "p_wf", "p_wh", "p_res", "days_on"):
             if col in d.columns:
@@ -1328,9 +1355,13 @@ class ProductionData:
         d["Gp_ws"] = np.cumsum(d["q_ws"] * eff) / MSCF_PER_MMSCF         # MMscf
         d["Np_cond"] = np.cumsum(d["q_cond"] * eff) / 1.0e3              # Mstb
         if "q_water" in d.columns:
+            _qw = pd.to_numeric(d["q_water"], errors="coerce").fillna(0.0)
+            # Negative water is clipped, which is right, but it was clipped in
+            # silence. A sign error or a bad meter is worth knowing about when
+            # the water trend is what ends the well.
+            qc.n_negative_water = int((_qw < 0).sum())
             d["Wp_water"] = np.cumsum(
-                pd.to_numeric(d["q_water"], errors="coerce").fillna(0.0).clip(
-                    lower=0.0) * eff) / 1.0e3                             # Mstb
+                _qw.clip(lower=0.0) * eff) / 1.0e3                        # Mstb
         with np.errstate(divide="ignore", invalid="ignore"):
             d["cgr"] = np.where(d["q_gas"] > 0,
                                 d["q_cond"] / (d["q_gas"] / MSCF_PER_MMSCF),
@@ -7067,6 +7098,35 @@ def run_self_tests(verbose: bool = True) -> bool:
         # the cumulative, the material balance and the EUR without changing a
         # single row count.
         qcv = res.data.qc
+        # (d) a repeated date silently double-counted its volume and stopped
+        # `t` increasing, which every cumulative and trend downstream rests on.
+        d_clean = ProductionData.prepare(df, pvt, well="C")
+        df_dup = pd.concat([df, df.iloc[[len(df) // 2]]], ignore_index=True)
+        d_dup = ProductionData.prepare(df_dup, pvt, well="D")
+        check("a repeated date is dropped, not counted twice",
+              d_dup.qc.n_duplicate_dates == 1
+              and abs(float(d_dup.Gp_ws[-1]) - float(d_clean.Gp_ws[-1])) < 1e-6
+              and bool(np.all(np.diff(d_dup.t) > 0)),
+              f"Gp {d_dup.Gp_ws[-1]:,.1f} vs clean {d_clean.Gp_ws[-1]:,.1f} "
+              "MMscf, t strictly increasing")
+        # A repeat carrying a DIFFERENT rate is usually two wells merged.
+        df_mix = df.copy()
+        row = df_mix.iloc[[len(df_mix) // 2]].copy()
+        row["q_gas"] = float(row["q_gas"].iloc[0]) * 0.5
+        d_mix = ProductionData.prepare(pd.concat([df_mix, row],
+                                                 ignore_index=True),
+                                       pvt, well="M")
+        check("repeated dates with different rates are called out",
+              any("merged into one series" in n for n in d_mix.qc.notes),
+              "two wells in one series is a grouping error, not a data point")
+        # (e) negative water is clipped - correctly - but no longer in silence.
+        d_negw = ProductionData.prepare(df.assign(q_water=-1.0), pvt, well="W")
+        check("negative water readings are counted, not silently clipped",
+              d_negw.qc.n_negative_water > 0
+              and "negative water readings" in d_negw.qc.summary()
+              and float(d_negw.df["Wp_water"].iloc[-1]) == 0.0,
+              f"{d_negw.qc.n_negative_water} row(s) clipped to zero")
+
         check("the volume inside dropped rows is measured, not just the count",
               qcv.excluded_gp_mmscf >= 0 and 0 <= qcv.excluded_gp_frac <= 1
               and (qcv.excluded_gp_mmscf == 0
