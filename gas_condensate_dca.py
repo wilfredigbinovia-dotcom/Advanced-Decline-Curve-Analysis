@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "21.0"
+__version__ = "22.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2075,12 +2075,17 @@ class FitResult:
     at_bounds: List[str] = field(default_factory=list)
     converged: bool = True
     message: str = ""
+    # Why this fit is the one being forecast on. Blank for fits that were only
+    # ranked; set on the selected one.
+    selection_note: str = ""
 
     def predict(self, t: np.ndarray) -> np.ndarray:
         return self.model.rate(np.asarray(t, dtype=float))
 
     def summary(self) -> str:
-        lines = [f"  model     : {self.model_name}",
+        lines = [f"  model     : {self.model_name}"
+                 + (f"   ({self.selection_note})" if self.selection_note
+                    else ""),
                  f"  points    : {self.n_points}",
                  f"  t0 (ref)  : day {self.t0:.0f} "
                  f"({self.t0 / DAYS_PER_YEAR:.2f} yr on production)",
@@ -5357,9 +5362,34 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     table = pd.DataFrame(rows).sort_values("AIC").reset_index(drop=True)
 
     key = table.iloc[0]["model"] if select == "auto" else select
+    requested = key
     if key not in fits:
         key = table.iloc[0]["model"]
     best = fits[key]
+
+    # Say WHY this model is the one being forecast on. The ranking table sits
+    # directly above the selected fit in the report, and when the selection is
+    # not the top row - because the model was set explicitly - a reader has no
+    # way to tell a deliberate choice from a selection bug. Worse, the model
+    # chosen can be one whose parameters are pinned while an unpinned
+    # alternative ranks better, which is exactly the 8L case: sepd is both the
+    # AIC winner and the only candidate not at a bound, and the forecast runs
+    # on modified_hyperbolic with b pinned at 2.
+    rank = int(table.index[table["model"] == key][0]) + 1
+    if select == "auto":
+        why = f"lowest AIC of {len(table)} candidates"
+    elif requested != key:
+        why = (f"'{requested}' was requested but did not fit; fell back to the "
+               f"lowest-AIC model")
+    else:
+        why = f"model set explicitly (AIC rank {rank} of {len(table)})"
+    clean = table[table["at_bounds"] == "-"]
+    if best.at_bounds and len(clean) and clean.iloc[0]["model"] != key:
+        why += (f" - NOTE: '{clean.iloc[0]['model']}' ranks "
+                f"{int(table.index[table['model'] == clean.iloc[0]['model']][0]) + 1}"
+                f" and has no parameter at a bound, while this fit pins "
+                f"{', '.join(best.at_bounds)}")
+    best.selection_note = why
 
     # -- yield model ------------------------------------------------------
     gp_dew, gp_dew_note = gp_at_dewpoint(data.surveys, pvt.p_dew,
@@ -6929,6 +6959,21 @@ def run_self_tests(verbose: bool = True) -> bool:
         # only in the selected-fit block. `converged` says True for a fit the
         # optimiser walked into its bound and abandoned there.
         tbl = res.model_table
+        # The ranking table sits directly above the selected fit, so when the
+        # selection is not the top row the report has to say why - otherwise a
+        # deliberate choice and a selection bug look identical.
+        check("the selected fit says why it was selected",
+              bool(res.best_fit.selection_note)
+              and res.best_fit.selection_note in res.best_fit.summary(),
+              res.best_fit.selection_note[:70])
+        res_auto = analyse_well(df, pvt, well="TEST", verbose=False,
+                                run_monte_carlo=False, select="auto")
+        check("'auto' selects the lowest-AIC model and says so",
+              res_auto.best_fit.model_name.lower().replace("_", "")
+              == res_auto.model_table.iloc[0]["model"].replace("_", "")
+              or "lowest AIC" in res_auto.best_fit.selection_note,
+              res_auto.best_fit.selection_note[:70])
+
         check("the model ranking table exposes pinned parameters",
               "at_bounds" in tbl.columns
               and all((tbl.loc[tbl["model"] == m, "at_bounds"].iloc[0] == "-")
