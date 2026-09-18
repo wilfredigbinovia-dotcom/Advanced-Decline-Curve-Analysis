@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "13.0"
+__version__ = "14.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2491,26 +2491,83 @@ class WaterInLiquid:
     r2: float = float("nan")
     n: int = 0
     reason: str = ""
+    # Water cut and cumulative production almost always rise together, so a
+    # raw CGR-vs-water-cut correlation cannot tell "the CGR rises because of
+    # water" from "the CGR rises because the gas is depleting". These hold the
+    # same correlation with depletion partialled out, which can and does
+    # collapse to zero on real wells.
+    partial_correlation: float = float("nan")   # rho(CGR, wcut | Gp)
+    depletion_correlation: float = float("nan")  # rho(CGR, Gp)
+    partial_depletion: float = float("nan")      # rho(CGR, Gp | wcut)
+
+    @property
+    def confounded(self) -> bool:
+        """True when depletion, not water, survives as the explanation."""
+        if not (np.isfinite(self.partial_correlation)
+                and np.isfinite(self.partial_depletion)):
+            return False
+        return bool(abs(self.partial_correlation) < 0.3
+                    and abs(self.partial_depletion)
+                    > abs(self.partial_correlation) + 0.2)
 
     @property
     def water_driven(self) -> bool:
-        return bool(self.ok and np.isfinite(self.p_value)
-                    and self.p_value < 0.05 and self.correlation > 0.5)
+        if not (self.ok and np.isfinite(self.p_value)
+                and self.p_value < 0.05 and self.correlation > 0.5):
+            return False
+        # The raw correlation is necessary but nowhere near sufficient.
+        return not self.confounded
 
     def summary(self) -> str:
         if not self.ok:
             return f"  water-in-liquid   : not run ({self.reason})"
-        verdict = ("CGR tracks water cut - the extra liquid is water"
-                   if self.water_driven else
-                   "CGR does not track water cut")
-        return (f"  water-in-liquid   : rho {self.correlation:+.2f} "
-                f"(p {self.p_value:.1e}, n={self.n}) - {verdict}\n"
-                f"                      CGR extrapolated to zero water cut: "
-                f"{self.clean_cgr:,.0f} STB/MMscf")
+        if self.water_driven:
+            verdict = "CGR tracks water cut - the extra liquid is water"
+        elif self.confounded:
+            verdict = ("CGR tracks water cut ONLY because both rise with "
+                       "depletion - NOT evidence of water")
+        else:
+            verdict = "CGR does not track water cut"
+        out = [f"  water-in-liquid   : rho {self.correlation:+.2f} "
+               f"(p {self.p_value:.1e}, n={self.n}) - {verdict}"]
+        if np.isfinite(self.partial_correlation):
+            out.append(f"                      controlling for cumulative gas: "
+                       f"rho(CGR,wcut|Gp) {self.partial_correlation:+.2f}, "
+                       f"rho(CGR,Gp|wcut) {self.partial_depletion:+.2f}")
+        if self.confounded:
+            out.append("                      the water-cut link does not "
+                       "survive; look for a metering, allocation or emulsion\n"
+                       "                      explanation before crediting "
+                       "the liquid to water")
+        else:
+            out.append(f"                      CGR extrapolated to zero water "
+                       f"cut: {self.clean_cgr:,.0f} STB/MMscf")
+        return "\n".join(out)
+
+
+def _partial_spearman(x, y, z) -> Tuple[float, float]:
+    """Rank correlations of x with y and with z, each controlling for the other.
+
+    Ranks, then a correlation matrix, then its inverse: the off-diagonal of the
+    precision matrix, normalised, is the partial correlation. Returns
+    (rho(x,y|z), rho(x,z|y)), or (nan, nan) if the system is degenerate.
+    """
+    try:
+        r = np.corrcoef(np.vstack([stats.rankdata(x), stats.rankdata(y),
+                                   stats.rankdata(z)]))
+        if not np.all(np.isfinite(r)) or abs(np.linalg.det(r)) < 1e-12:
+            return float("nan"), float("nan")
+        p = np.linalg.inv(r)
+        xy = -p[0, 1] / math.sqrt(p[0, 0] * p[1, 1])
+        xz = -p[0, 2] / math.sqrt(p[0, 0] * p[2, 2])
+        return float(xy), float(xz)
+    except Exception:
+        return float("nan"), float("nan")
 
 
 def diagnose_water_in_liquid(cgr: np.ndarray, q_water: np.ndarray,
-                             q_cond: np.ndarray) -> WaterInLiquid:
+                             q_cond: np.ndarray,
+                             gp: Optional[np.ndarray] = None) -> WaterInLiquid:
     """Regress CGR on water cut. The intercept is the CGR without the water.
 
     A retrograde reservoir has no mechanism to raise its yield as water
@@ -2534,10 +2591,20 @@ def diagnose_water_in_liquid(cgr: np.ndarray, q_water: np.ndarray,
         return WaterInLiquid(ok=False, reason="water cut barely varies")
     rho, pv = stats.spearmanr(wcut, c)
     res = stats.linregress(wcut, c)
+
+    pc = pd_ = dep = float("nan")
+    if gp is not None:
+        g = np.asarray(gp, dtype=float)[ok]
+        if np.all(np.isfinite(g)) and float(np.ptp(g)) > 0:
+            pc, pd_ = _partial_spearman(c, wcut, g)
+            dep = float(stats.spearmanr(g, c).statistic)
+
     return WaterInLiquid(
         ok=True, correlation=float(rho), p_value=float(pv),
         clean_cgr=float(res.intercept), slope=float(res.slope),
-        r2=float(res.rvalue ** 2), n=int(len(c)))
+        r2=float(res.rvalue ** 2), n=int(len(c)),
+        partial_correlation=pc, depletion_correlation=dep,
+        partial_depletion=pd_)
 
 
 @dataclass
@@ -5053,7 +5120,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
         data.cgr,
         (pd.to_numeric(data.df["q_water"], errors="coerce").to_numpy(float)
          if "q_water" in data.df.columns else np.full(len(data.cgr), np.nan)),
-        data.q_cond)
+        data.q_cond, gp=data.Gp_ws)
     bank = bank_diagnostic(
         data.t, data.q_ws, data.Gp_ws, data.p_wf, pvt,
         ogip_choice.value if np.isfinite(ogip_choice.value) else None,
@@ -6201,6 +6268,36 @@ def run_self_tests(verbose: bool = True) -> bool:
           dd.ok and not dd.water_driven,
           f"rho {dd.correlation:+.2f} - falling while water rises, which is "
           "retrograde behaviour, not contamination")
+
+    # The confounding case, which is the one that matters on real wells: the
+    # CGR rises with DEPLETION, and water happens to rise over the same
+    # record. The raw correlation is large and significant and means nothing.
+    # Without the partial correlation this well is reported as "the extra
+    # liquid is water" on no evidence whatsoever.
+    gp_c = np.linspace(0.0, 18_000.0, n_d)
+    rng_c = np.random.default_rng(3)
+    # Water cut rises over the same record but is not a rank-identical copy
+    # of Gp, which is the real situation - an exact copy is singular and the
+    # partial correlation is correctly undefined.
+    wcut_c = np.clip(wcut_t + rng_c.normal(0.0, 0.06, n_d), 0.01, 0.95)
+    cgr_conf = 100.0 * np.exp(1.6 * gp_c / gp_c[-1]) \
+        * rng_c.lognormal(0.0, 0.08, n_d)          # rises with Gp only
+    dc = diagnose_water_in_liquid(cgr_conf, wcut_c * 100.0,
+                                  (1 - wcut_c) * 100.0, gp=gp_c)
+    check("a CGR rising with DEPLETION is not mistaken for water",
+          dc.ok and dc.correlation > 0.5 and dc.confounded
+          and not dc.water_driven,
+          f"raw rho {dc.correlation:+.2f} but rho(CGR,wcut|Gp) "
+          f"{dc.partial_correlation:+.2f} vs rho(CGR,Gp|wcut) "
+          f"{dc.partial_depletion:+.2f}")
+    # and the genuine water case must still survive the partial test
+    cgr_water_c = (60.0 / np.maximum(1.0 - wcut_c, 1e-6)
+                   * rng_c.lognormal(0.0, 0.05, n_d))
+    dw2 = diagnose_water_in_liquid(cgr_water_c, wcut_c * 100.0,
+                                   (1 - wcut_c) * 100.0, gp=gp_c)
+    check("genuine water contamination survives the confounding test",
+          dw2.ok and dw2.water_driven and not dw2.confounded,
+          f"rho(CGR,wcut|Gp) {dw2.partial_correlation:+.2f}")
 
     # 9d8 -- the bank, measured as lost productivity index
     df_pi = make_synthetic_well(pvt_cvd, ogip_mmscf=52000.0,
