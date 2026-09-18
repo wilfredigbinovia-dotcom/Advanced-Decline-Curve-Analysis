@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "18.0"
+__version__ = "19.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2333,6 +2333,7 @@ class YieldModel:
     at_bounds: List[str] = field(default_factory=list)
     n_points: int = 0
     cgr_ceiling: float = float("nan")   # initial CGR, if one was supplied
+    gp_dew_note: str = ""
 
     @property
     def warnings_(self) -> List[str]:
@@ -2367,9 +2368,59 @@ class YieldModel:
                 f"  cgr_i     : {self.cgr_i:.2f} STB/MMscf\n"
                 f"  cgr_min   : {self.cgr_min:.2f} STB/MMscf\n"
                 f"  k         : {self.k:.5g} 1/MMscf\n"
-                f"  Gp_dew    : {self.Gp_dew:.1f} MMscf\n"
+                f"  Gp_dew    : {self.Gp_dew:,.1f} MMscf"
+                + (f"  ({self.gp_dew_note})" if self.gp_dew_note else "") + "\n"
                 f"  R2        : {self.r2:.4f}"
                 + "".join(f"\n  WARNING   : {w}" for w in self.warnings_))
+
+
+def gp_at_dewpoint(surveys: pd.DataFrame, p_dew: Optional[float],
+                   gp_last: float) -> Tuple[Optional[float], str]:
+    """Cumulative gas at which the reservoir reached the dew point.
+
+    Three things went wrong in the inline version this replaces:
+
+    1. It read `p_res` off the RATE-QC'd frame. A gauge reading is a
+       measurement of the reservoir and the rate filters delete most of them;
+       `surveys` is the full record, which is why it exists.
+    2. It required the dew point to lie strictly INSIDE the survey range.
+       When the highest survey is already below the dew point - i.e. the
+       reservoir was below it before anyone logged a pressure, which is the
+       common case on a well whose first survey is months late - it returned
+       None and left Gp_dew as a free parameter. The optimiser then pinned it
+       to its upper bound. The correct answer there is zero: the yield has
+       been declining since the first record.
+    3. `np.interp` needs its x-array sorted. Survey pressures wobble - gauge
+       scatter, a build-up after a shut-in - and an unsorted x silently
+       returns nonsense rather than raising.
+    """
+    if p_dew is None or not np.isfinite(p_dew) or p_dew <= 0:
+        return None, ""
+    if surveys is None or len(surveys) == 0 or "p_res" not in surveys.columns:
+        return None, ""
+    pr = pd.to_numeric(surveys["p_res"], errors="coerce").to_numpy(float)
+    gp = pd.to_numeric(surveys["Gp_ws"], errors="coerce").to_numpy(float)
+    m = np.isfinite(pr) & np.isfinite(gp) & (pr > 0)
+    pr, gp = pr[m], gp[m]
+    if len(pr) < 2:
+        return None, ""
+
+    p_hi, p_lo = float(np.max(pr)), float(np.min(pr))
+    if p_dew >= p_hi:
+        gp0 = float(gp[int(np.argmax(pr))])
+        return gp0, (f"the reservoir was already below the {p_dew:,.0f} psia "
+                     f"dew point at the first survey ({p_hi:,.0f} psia), so "
+                     f"the yield break is set at Gp = {gp0:,.0f} MMscf")
+    if p_dew <= p_lo:
+        return gp_last, (f"every survey is above the {p_dew:,.0f} psia dew "
+                         "point, so no yield break has been reached yet")
+
+    # Sort by DESCENDING pressure so the interpolation axis is monotonic.
+    order = np.argsort(-pr)
+    pr_s, gp_s = pr[order], gp[order]
+    gpd = float(np.interp(-p_dew, -pr_s, gp_s))
+    return gpd, (f"dew point reached at Gp = {gpd:,.0f} MMscf, interpolated "
+                 f"between surveys")
 
 
 def fit_yield_model(Gp: np.ndarray, cgr: np.ndarray,
@@ -5224,14 +5275,11 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     best = fits[key]
 
     # -- yield model ------------------------------------------------------
-    gp_dew = None
-    if pvt.p_dew is not None and data.p_res is not None:
-        pr = data.p_res
-        okp = np.isfinite(pr)
-        if okp.sum() >= 2 and np.nanmin(pr) < pvt.p_dew < np.nanmax(pr):
-            gp_dew = float(np.interp(-pvt.p_dew, -pr[okp], data.Gp_ws[okp]))
+    gp_dew, gp_dew_note = gp_at_dewpoint(data.surveys, pvt.p_dew,
+                                         float(data.Gp_ws[-1]))
     yield_model = fit_yield_model(data.Gp_ws, data.cgr, Gp_dew=gp_dew,
                                   fit_dewpoint_break=(gp_dew is None))
+    yield_model.gp_dew_note = gp_dew_note
     # The initial CGR is a physical ceiling on the produced ratio, so the
     # yield fit can be checked against it instead of being reported as if the
     # data were beyond question.
@@ -6690,6 +6738,29 @@ def run_self_tests(verbose: bool = True) -> bool:
     ym_true = YieldModel(cgr_i=80.0, cgr_min=25.0, k=1.2e-4, Gp_dew=4000.0)
     gpx = np.linspace(0, 30000, 60)
     cgrx = ym_true(gpx) * np.random.default_rng(2).lognormal(0, 0.04, 60)
+    # 10a -- where the dew point sits on the cumulative
+    sv = pd.DataFrame({"p_res": [6400.0, 5800.0, 5000.0, 4400.0],
+                       "Gp_ws": [0.0, 4000.0, 9000.0, 14000.0]})
+    g_in, n_in = gp_at_dewpoint(sv, 5100.0, 14000.0)
+    check("dew point inside the survey range is interpolated",
+          g_in is not None and 8000 < g_in < 9000, f"Gp_dew {g_in:,.0f} MMscf")
+    # The case that broke 8L: every survey is already BELOW the dew point.
+    # The old code returned None here and the optimiser pinned Gp_dew to its
+    # upper bound, putting the yield break at 80 % of the record.
+    g_lo, n_lo = gp_at_dewpoint(sv, 7000.0, 14000.0)
+    check("a dew point above every survey sets the break at the first survey",
+          g_lo == 0.0, n_lo[:70])
+    g_hi, _ = gp_at_dewpoint(sv, 3000.0, 14000.0)
+    check("a dew point below every survey means the break is not yet reached",
+          g_hi == 14000.0, "no yield break in the record")
+    # Survey pressures wobble; np.interp on an unsorted axis returns nonsense
+    # without raising, so the sort has to be enforced.
+    sv_sc = sv.iloc[[2, 0, 3, 1]].reset_index(drop=True)
+    g_sc, _ = gp_at_dewpoint(sv_sc, 5100.0, 14000.0)
+    check("out-of-order surveys give the same answer as sorted ones",
+          g_sc is not None and abs(g_sc - g_in) < 1e-6,
+          f"{g_sc:,.0f} vs {g_in:,.0f} MMscf")
+
     ymf = fit_yield_model(gpx, cgrx, Gp_dew=4000.0, fit_dewpoint_break=False)
     check("a good yield fit raises no warnings",
           not ymf.warnings_ and not ymf.at_bounds,
