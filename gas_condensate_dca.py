@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "19.0"
+__version__ = "20.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -1379,10 +1379,25 @@ class ProductionData:
             qc.bdf_start_index, qc.bdf_start_days = b_idx, b_t
             starts = [v for v in (p_t, b_t) if v is not None]
             qc.fit_start_days = max(starts) if starts else None
-            if p_t is not None and p_idx and p_idx > 0:
-                qc.notes.append(
-                    f"Plateau/constrained period of {p_idx} points excluded from "
-                    "the decline fit (rate set by facilities, not the reservoir).")
+            # Report the TOTAL number of points the fit will not see, not just
+            # the plateau. The plateau index alone undercounts whenever the
+            # BDF estimate lands later than the plateau end - on 8L it said 15
+            # points were excluded when the fit actually started 36 points in,
+            # which reads as a much smaller intervention than it was.
+            if qc.fit_start_days is not None:
+                n_excl = int(np.sum(obj.t < float(qc.fit_start_days)))
+                if n_excl > 0:
+                    parts = []
+                    if p_t is not None and p_idx:
+                        parts.append(f"{p_idx} on the plateau/constrained "
+                                     "period (rate set by facilities, not the "
+                                     "reservoir)")
+                    if b_t is not None and (p_t is None or b_t > p_t):
+                        parts.append(f"the rest before the boundary-dominated "
+                                     f"flow start at day {b_t:,.0f}")
+                    qc.notes.append(
+                        f"{n_excl} of {len(obj.t)} retained points excluded "
+                        f"from the decline fit: " + "; ".join(parts) + ".")
         return obj
 
     # ---- convenient array views -----------------------------------------
@@ -2293,8 +2308,16 @@ def rank_models(t: np.ndarray, q: np.ndarray,
             warnings.warn(f"{name} fit failed: {exc}")
             continue
         fits[name] = fr
+        # `converged` alone is misleading: an optimiser that walks a parameter
+        # into its bound and stops reports success. On 8L three of these four
+        # models are pinned - and the two that look identical (ple and sepd,
+        # the same R2 to six figures) ARE identical, because ple's Dinf
+        # collapsed to zero, which is sepd with one more parameter. None of
+        # that showed in a table whose only quality column said True.
         rows.append({"model": name, "R2_log": fr.r2, "RMSE_log": fr.rmse_log,
-                     "AIC": fr.aic, "BIC": fr.bic, "converged": fr.converged})
+                     "AIC": fr.aic, "BIC": fr.bic, "converged": fr.converged,
+                     "at_bounds": ",".join(fr.at_bounds) if fr.at_bounds
+                                  else "-"})
     table = (pd.DataFrame(rows).sort_values("AIC").reset_index(drop=True)
              if rows else pd.DataFrame())
     return table, fits
@@ -5263,8 +5286,16 @@ def analyse_well(df: pd.DataFrame | ProductionData,
             warnings.warn(f"[{well}] {name} failed: {exc}")
             continue
         fits[name] = fr
+        # `converged` alone is misleading: an optimiser that walks a parameter
+        # into its bound and stops reports success. On 8L three of these four
+        # models are pinned - and the two that look identical (ple and sepd,
+        # the same R2 to six figures) ARE identical, because ple's Dinf
+        # collapsed to zero, which is sepd with one more parameter. None of
+        # that showed in a table whose only quality column said True.
         rows.append({"model": name, "R2_log": fr.r2, "RMSE_log": fr.rmse_log,
-                     "AIC": fr.aic, "BIC": fr.bic, "converged": fr.converged})
+                     "AIC": fr.aic, "BIC": fr.bic, "converged": fr.converged,
+                     "at_bounds": ",".join(fr.at_bounds) if fr.at_bounds
+                                  else "-"})
     if not fits:
         raise RuntimeError(f"[{well}] no decline model could be fitted.")
     table = pd.DataFrame(rows).sort_values("AIC").reset_index(drop=True)
@@ -6803,6 +6834,30 @@ def run_self_tests(verbose: bool = True) -> bool:
               and res.mc_stats["EUR wellstream gas (MMscf)"]["P90"]
               <= res.mc_stats["EUR wellstream gas (MMscf)"]["P10"])
         check("end-to-end analysis runs and is self-consistent", ok)
+
+        # The QC note used to quote the PLATEAU point count as if it were the
+        # whole exclusion. When the BDF start lands later than the plateau end
+        # - which is the normal case - it undercounts badly: 8L was told 15
+        # points were excluded when the fit began 36 points into the record.
+        n_excl_true = int(np.sum(res.data.t < float(res.data.qc.fit_start_days)))
+        note = " ".join(res.data.qc.notes)
+        check("the QC note counts every point the decline fit does not see",
+              (not n_excl_true) or f"{n_excl_true} of" in note,
+              f"{n_excl_true} excluded; note says: {note[:60]}")
+        check("fit points plus excluded points equal the retained rows",
+              res.best_fit.n_points + n_excl_true == len(res.data.t),
+              f"{res.best_fit.n_points} + {n_excl_true} = {len(res.data.t)}")
+
+        # A model pinned to a bound must be visible in the ranking table, not
+        # only in the selected-fit block. `converged` says True for a fit the
+        # optimiser walked into its bound and abandoned there.
+        tbl = res.model_table
+        check("the model ranking table exposes pinned parameters",
+              "at_bounds" in tbl.columns
+              and all((tbl.loc[tbl["model"] == m, "at_bounds"].iloc[0] == "-")
+                      == (not res.fits[m].at_bounds)
+                      for m in tbl["model"] if m in res.fits),
+              "at_bounds column agrees with every FitResult")
     except Exception as exc:
         check("end-to-end analysis runs and is self-consistent", False, str(exc))
 
