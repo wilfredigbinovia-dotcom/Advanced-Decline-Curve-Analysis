@@ -795,7 +795,12 @@ with st.sidebar:
              "defensible late-time limit. 'auto' picks the lowest AIC, which "
              "is a statistical choice, not a physical one.")
     terminal = st.slider("Terminal decline (%/yr)", 2.0, 25.0, 7.0, 0.5)
-    t_max = st.slider("Max forecast life (years)", 5, 60, 40, 1)
+    t_max = st.slider(
+        "Forecast horizon (years from last record)", 1, 60, 30, 1,
+        help="How far past the end of the history to roll the decline "
+             "forward. This is forecast length, not total well life: a well "
+             "with 14 years of history and a 10-year horizon is abandoned at "
+             "24 years on production.")
 
     with st.expander("QC thresholds"):
         rate_basis = st.radio("Rate basis", ["stream-day", "calendar-day"],

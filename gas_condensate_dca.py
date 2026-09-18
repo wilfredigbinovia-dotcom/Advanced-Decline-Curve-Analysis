@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "10.0"
+__version__ = "11.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -4313,11 +4313,19 @@ class Forecast:
     constraint_years: Dict[str, float] = field(default_factory=dict)
     water_trend: Optional[WaterTrend] = None
     q_water_last_stbd: float = float("nan")
+    # Years of FORECAST, i.e. from the last historical record to abandonment.
+    # `economic_life_years` is the total well life from first production; on a
+    # well with a long history the two are very different numbers and quoting
+    # only the first invites the reader to compare it with a forecast horizon
+    # it is not on the same footing as.
+    forecast_years: float = float("nan")
 
     def summary(self) -> str:
         return "\n".join([
             f"  economic life      : {self.economic_life_years:.1f} yr "
-            f"(from first production)",
+            f"(from first production)"
+            + ("" if not np.isfinite(self.forecast_years) else
+               f", of which {self.forecast_years:.1f} yr is forecast"),
             "  EUR (history + forecast)",
             f"    wellstream gas   : {self.eur_wellstream_mmscf:,.0f} MMscf",
             f"    sales gas        : {self.eur_sales_gas_mmscf:,.0f} MMscf",
@@ -4367,14 +4375,33 @@ def forecast_products(fit: FitResult,
     """
     products = products or ProductSplit()
     model = fit.model
-    t_max = t_max_years * DAYS_PER_YEAR
 
-    t_ab = model.time_to_rate(q_econ_mscfd, t_max=t_max)
+    # `t_max_years` is the length of the FORECAST, measured from the last
+    # historical record - not the total life of the well from first
+    # production. Those coincide only for a well with no history, and reading
+    # it the other way is how a 14-year-old well asked for a "10 year
+    # forecast" used to get an abandonment day EARLIER than its own last
+    # record: the time array ran backwards and the remaining volumes came out
+    # negative. The horizon is therefore anchored on `t_start_days`, which
+    # makes it impossible for the forecast window to close before it opens.
+    horizon_days = max(float(t_max_years) * DAYS_PER_YEAR, step_days)
+    t_end_max = float(t_start_days) + horizon_days
+
+    # `time_to_rate` measures its own t_max from the fit reference t0, so the
+    # span has to be translated out of absolute days before it is passed in.
+    t_ab = model.time_to_rate(
+        q_econ_mscfd, t_max=max(t_end_max - model.t0, step_days))
     if not np.isfinite(t_ab):
-        t_ab = t_max
-    t_ab = float(min(max(t_ab, t_start_days + step_days), t_max))
+        t_ab = t_end_max
+    t_ab = float(min(max(t_ab, t_start_days + step_days), t_end_max))
 
-    t = np.arange(t_start_days, t_ab + step_days, step_days)
+    # Step from the forecast start and land exactly on t_ab. The old
+    # `arange(t_start, t_ab + step, step)` overshot the abandonment day by up
+    # to one step, so a "10 year" forecast quietly produced 10.1 years of gas.
+    n_steps = int(np.floor((t_ab - t_start_days) / step_days))
+    t = t_start_days + step_days * np.arange(max(n_steps, 0) + 1)
+    if t[-1] < t_ab - 1e-6:
+        t = np.append(t, t_ab)
     if t.size < 2:
         t = np.array([t_start_days, t_ab])
     q_ws = model.rate(t)
@@ -4392,6 +4419,16 @@ def forecast_products(fit: FitResult,
     cut_at = len(t)
 
     if ogip_cap_mmscf is not None and np.isfinite(ogip_cap_mmscf):
+        if ogip_cap_mmscf <= gp_to_date_mmscf:
+            # The well has already produced more than the gas in place the
+            # material balance says it holds. That is a statement about the
+            # gas-in-place estimate, not about the well, so say so instead of
+            # silently returning a forecast of nothing.
+            warnings.warn(
+                f"gas-in-place cap {ogip_cap_mmscf:,.0f} MMscf is at or below "
+                f"cumulative production {gp_to_date_mmscf:,.0f} MMscf; the cap "
+                "is wrong, not the well - check p_i, the survey pressures and "
+                "the wellstream conversion.")
         over = np.flatnonzero(gp > ogip_cap_mmscf)
         if over.size:
             constraint_years["gas in place"] = float(
@@ -4430,7 +4467,7 @@ def forecast_products(fit: FitResult,
         t, q_ws, gp = t[:keep], q_ws[:keep], gp[:keep]
         q_water = q_water[:keep]
         t_ab = float(t[-1])
-    if t_ab >= t_max - 1e-9 and reason == "gas rate":
+    if t_ab >= t_end_max - 1e-9 and reason == "gas rate":
         reason = "max forecast life"
 
     cgr = yield_model(gp)                          # STB/MMscf
@@ -4485,6 +4522,7 @@ def forecast_products(fit: FitResult,
         water_trend=water_trend,
         q_water_last_stbd=(float(q_water[-1]) if len(q_water)
                            and np.isfinite(q_water[-1]) else float("nan")),
+        forecast_years=float((t[-1] - t_start_days) / DAYS_PER_YEAR),
     )
 
 
@@ -6272,6 +6310,56 @@ def run_self_tests(verbose: bool = True) -> bool:
         check("end-to-end analysis runs and is self-consistent", ok)
     except Exception as exc:
         check("end-to-end analysis runs and is self-consistent", False, str(exc))
+
+    # 13 -- a forecast horizon shorter than the history cannot go backwards.
+    # This is the v11 regression: `t_max_years` used to be read as total well
+    # life from first production, so asking a 14-year-old well for a 10-year
+    # forecast put the abandonment day before the last record, ran the time
+    # array in reverse and reported negative remaining reserves.
+    try:
+        t_hist = 14.3 * DAYS_PER_YEAR          # a long-lived well, like 8L
+        gp_hist = 19_654.0                     # MMscf already produced
+        mh13 = ModifiedHyperbolic(
+            qi=9977.0, Di=0.00128, b=2.0,
+            Dmin=ModifiedHyperbolic.annual_effective_to_nominal(0.07))
+        p13 = {k: float(getattr(mh13, k)) for k in mh13.param_names}
+        fit13 = FitResult(
+            model=mh13, model_name="modified_hyperbolic", params=p13,
+            stderr={k: 0.0 for k in p13}, cov=np.eye(len(p13)) * 1e-12,
+            n_points=42, rmse_log=0.24, r2=0.62, aic=-113.0, bic=-108.0,
+            t_fit=np.array([2526.0, t_hist]),
+            q_fit=np.array([9977.0, 2000.0]), t0=2526.0)
+        ym13 = YieldModel(cgr_i=140.0, cgr_min=115.0, k=1e-9,
+                          Gp_dew=15_739.0)
+        oks, details = [], []
+        for horizon in (1.0, 5.0, 10.0, 30.0):
+            f13 = forecast_products(
+                fit13, ym13, pvt, q_econ_mscfd=800.0,
+                gp_to_date_mmscf=gp_hist, t_start_days=t_hist,
+                t_max_years=horizon)
+            tt = f13.table["t_days"].to_numpy(float)
+            oks.append(f13.remaining_wellstream_mmscf >= 0.0
+                       and f13.remaining_condensate_mstb >= 0.0
+                       and f13.eur_wellstream_mmscf >= gp_hist
+                       and tt[0] >= t_hist - 1e-6
+                       and bool(np.all(np.diff(tt) > 0))
+                       and f13.forecast_years <= horizon + 1e-6)
+            details.append(f"{horizon:g}->{f13.forecast_years:.1f}")
+        check("a forecast horizon shorter than the history stays forward",
+              all(oks), "horizon yr -> forecast yr: " + ", ".join(details))
+
+        f13 = forecast_products(fit13, ym13, pvt, q_econ_mscfd=800.0,
+                                gp_to_date_mmscf=gp_hist,
+                                t_start_days=t_hist, t_max_years=10.0)
+        check("forecast_years is the horizon, not the total life",
+              abs(f13.forecast_years
+                  - (f13.economic_life_years - t_hist / DAYS_PER_YEAR)) < 0.1
+              and f13.economic_life_years > t_hist / DAYS_PER_YEAR,
+              f"life {f13.economic_life_years:.1f} yr on production, "
+              f"{f13.forecast_years:.1f} yr of it forecast")
+    except Exception as exc:
+        check("a forecast horizon shorter than the history stays forward",
+              False, str(exc))
 
     if verbose:
         width = 62
