@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "25.0"
+__version__ = "26.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -3983,6 +3983,15 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
     if np.isfinite(ceil) and np.isfinite(pick) and pick > ceil * CEILING_SLACK:
         why += (f" Clipped from {pick:,.0f} to the We >= 0 ceiling of "
                 f"{ceil:,.0f} MMscf, which no gas in place may exceed.")
+        # The SOURCE has to change with the value. It did not: asking for the
+        # p/z line on 8L returned the ceiling, 85,932 MMscf, still labelled
+        # "p/z line" while the p/z line itself was 144,232. The app's gas-in-
+        # place tile and this module's own "<-- used" marker both key on this
+        # string, so both were naming a number that is not the one shown.
+        # The spread has to follow too - it is the ceiling's now, not the
+        # intercept's.
+        src = f"We>=0 ceiling (clipped from the {src})"
+        sig = 0.10
         pick, clipped = ceil, True
 
     if not (np.isfinite(pick) and pick > 0):
@@ -5520,23 +5529,39 @@ def analyse_well(df: pd.DataFrame | ProductionData,
         else:
             try:
                 wcol = ("Wp_water" if "Wp_water" in surv.columns else None)
+                # Clamp ONCE, here, and use the clamped count everywhere.
+                # `material_balance_pz` clamped internally to leave three
+                # surveys standing, but the aquifer fit below sliced with the
+                # RAW number - so asking to skip 20 of 10 surveys gave the p/z
+                # line seven dropped and the aquifer fit an empty array, which
+                # failed into a warning nobody reads and quietly removed the
+                # Fetkovich candidate from the cap selection.
+                skip_req = int(max(mb_skip_early, 0))
+                skip = int(np.clip(skip_req, 0, max(len(surv) - 3, 0)))
                 matbal = material_balance_pz(
                     surv["p_res"].to_numpy(float),
                     surv["Gp_ws"].to_numpy(float), pvt,
                     water_mstb=(surv[wcol].to_numpy(float) if wcol else None),
-                    p_initial=mb_p_initial, skip_early=mb_skip_early,
+                    p_initial=mb_p_initial, skip_early=skip,
                     p_initial_estimated=p_initial_estimated)
                 matbal_note = (f"{matbal.n_surveys} pressure surveys used"
                                + (f", {matbal.n_skipped} earliest dropped."
                                   if matbal.n_skipped else "."))
-                if use_aquifer and len(surv) >= 4:
+                if skip_req > skip:
+                    matbal_note += (f" (You asked to drop {skip_req}; only "
+                                    f"{skip} could be dropped without leaving "
+                                    "fewer than three surveys to fit.)")
+                    warnings.warn(
+                        f"[{well}] skip_early {skip_req} reduced to {skip}: "
+                        f"only {len(surv)} surveys are available.")
+                if use_aquifer and len(surv) - skip >= 4:
                     try:
                         matbal.fetkovich = aquifer_fit(
-                            surv["t"].to_numpy(float)[mb_skip_early:],
-                            surv["p_res"].to_numpy(float)[mb_skip_early:],
-                            surv["Gp_ws"].to_numpy(float)[mb_skip_early:],
+                            surv["t"].to_numpy(float)[skip:],
+                            surv["p_res"].to_numpy(float)[skip:],
+                            surv["Gp_ws"].to_numpy(float)[skip:],
                             pvt, matbal.p_initial,
-                            water_mstb=(surv[wcol].to_numpy(float)[mb_skip_early:]
+                            water_mstb=(surv[wcol].to_numpy(float)[skip:]
                                         if wcol else None),
                             model=aquifer_model)
                     except Exception as exc:
@@ -6569,6 +6594,24 @@ def run_self_tests(verbose: bool = True) -> bool:
               and np.isfinite(m.g_ceiling_mmscf)),
           f"checked for the closed and supported tanks, every mode, at "
           f"{100 * (CEILING_SLACK - 1):.0f} % slack on a minimum statistic")
+    # A clipped cap must not keep the label of the number it was clipped FROM.
+    # The app's gas-in-place tile and this module's "<-- used" marker both key
+    # on `source`, so a value of 85,932 labelled "p/z line" - when the p/z line
+    # was 144,232 - names a number that is not the one shown.
+    mb_clip = material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi)
+    mb_clip.ogip_mmscf = float(mb_clip.g_ceiling_mmscf) * 3.0
+    mb_clip.ogip_stderr = 0.05 * mb_clip.ogip_mmscf
+    oc_clip = select_ogip(mb_clip, None, "pz")
+    check("a clipped cap is relabelled as the ceiling, not its origin",
+          oc_clip.clipped_to_ceiling
+          and abs(oc_clip.value - mb_clip.g_ceiling_mmscf) < 1e-6
+          and "ceiling" in oc_clip.source and "clipped from" in oc_clip.source,
+          f"{oc_clip.value:,.0f} MMscf labelled '{oc_clip.source}'")
+    check("a cap that is NOT clipped keeps its own label",
+          select_ogip(material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi),
+                      None, "ceiling").source == "We>=0 ceiling",
+          "only the clip renames the source")
+
     check("a cap well above the ceiling is still clipped",
           select_ogip(sup_cap, mode="p/z").clipped_to_ceiling
           and select_ogip(sup_cap, mode="p/z").value
@@ -7126,6 +7169,28 @@ def run_self_tests(verbose: bool = True) -> bool:
               and "negative water readings" in d_negw.qc.summary()
               and float(d_negw.df["Wp_water"].iloc[-1]) == 0.0,
               f"{d_negw.qc.n_negative_water} row(s) clipped to zero")
+
+        # (f) `skip_early` was clamped by the material balance but NOT by the
+        # aquifer fit beside it, so an over-large value gave the two different
+        # survey sets and silently deleted the Fetkovich candidate.
+        r_skip = analyse_well(df, pvt, well="S", verbose=False,
+                              run_monte_carlo=False, mb_skip_early=99)
+        r_none = analyse_well(df, pvt, well="S0", verbose=False,
+                              run_monte_carlo=False, mb_skip_early=0)
+        n_sv = len(r_none.data.surveys)
+        mbs = r_skip.matbal
+        # The clamp must leave at least three surveys, must be the SAME count
+        # the aquifer fit sees, and the aquifer fit may only be missing when
+        # fewer than four surveys survive it - never because the two disagreed.
+        ok_skip = (mbs is not None and mbs.n_surveys >= 3
+                   and mbs.n_skipped == max(min(99, n_sv - 3), 0)
+                   and (mbs.fetkovich is not None
+                        or (n_sv - mbs.n_skipped) < 4))
+        check("an over-large skip_early is clamped for every consumer",
+              ok_skip,
+              f"{n_sv} surveys, asked to drop 99, dropped "
+              f"{mbs.n_skipped}, kept {mbs.n_surveys}; aquifer fit "
+              f"{'present' if mbs.fetkovich else 'absent (too few left)'}")
 
         check("the volume inside dropped rows is measured, not just the count",
               qcv.excluded_gp_mmscf >= 0 and 0 <= qcv.excluded_gp_frac <= 1
