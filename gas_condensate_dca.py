@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "22.0"
+__version__ = "23.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -3074,6 +3074,17 @@ class MaterialBalanceResult:
             lines.append(f"                      G is only bounded to "
                          f"{f['g_range_mmscf'][0]:,.0f}-"
                          f"{f['g_range_mmscf'][1]:,.0f} MMscf by this fit")
+            wef = f.get("we_frac_hcpv", float("nan"))
+            if np.isfinite(wef):
+                lines.append(f"                      We is {100 * wef:,.0f} % "
+                             "of the hydrocarbon pore volume at this G")
+            # `fetkovich_health` exists precisely so a fit that is not a fit
+            # cannot read like one, and the app has called it since it was
+            # written - but this report never did. An optimiser always returns
+            # numbers, so an aquifer fit printed without these checks looks
+            # identical whether it matched the history or ran to its bounds.
+            for bad in fetkovich_health(f):
+                lines.append(f"  WARNING           : aquifer fit - {bad}")
         if self.drive_note:
             lines.append(f"  drive             : {self.drive_note}")
         return "\n".join(lines)
@@ -6422,6 +6433,26 @@ def run_self_tests(verbose: bool = True) -> bool:
                             "G_mmscf": 77918.0,
                             "g_range_mmscf": (71054.0, 86058.0)}) == [],
           "no complaints")
+    # ...and the REPORT has to call them. The app has run these checks since
+    # they were written; the text summary never did, so an aquifer fit that
+    # ran to its bounds printed exactly like one that matched the history.
+    mb_fk = material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi)
+    mb_fk.fetkovich = {"G_mmscf": 42065.0, "Wei_mmbbl": 900.0,
+                       "J_bbl_d_psi": 3.0, "We_mmbbl": 40.0,
+                       "rms_pct": 46.44, "we_frac_hcpv": 0.97,
+                       "g_range_mmscf": (46272.0, 92543.0)}
+    s_bad = mb_fk.summary()
+    check("the report prints the aquifer health checks, not just the numbers",
+          s_bad.count("aquifer fit -") == 3 and "97 % of the hydrocarbon" in s_bad,
+          "rms, influx fraction and G-outside-locus all reach the report")
+    mb_fk.fetkovich = {"G_mmscf": 77918.0, "Wei_mmbbl": 100.0,
+                       "J_bbl_d_psi": 2.8, "We_mmbbl": 7.7,
+                       "rms_pct": 1.48, "we_frac_hcpv": 0.14,
+                       "g_range_mmscf": (71054.0, 86058.0)}
+    check("a healthy aquifer fit adds no warnings to the report",
+          "aquifer fit -" not in mb_fk.summary()
+          and "14 % of the hydrocarbon" in mb_fk.summary(),
+          "the influx fraction is still reported, without a complaint")
 
     # 9d1 -- the forecast cap is chosen by drive, not fixed on the p/z line
     ho_cap = material_balance_pz(p_syn, gp, pvt_cvd, p_initial=pi)
