@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "17.0"
+__version__ = "18.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2324,6 +2324,38 @@ class YieldModel:
     Gp_dew: float = 0.0
     r2: float = float("nan")
     stderr: Dict[str, float] = field(default_factory=dict)
+    # The decline fit has reported pinned parameters since the beginning; this
+    # fit never did, and it fails the same way. With k at its lower bound the
+    # model degenerates to a CONSTANT CGR, which is not a yield decline at all
+    # - and on 8L it did exactly that (k = 1e-09) while R2 came out NEGATIVE,
+    # meaning the fitted curve is worse than a horizontal line through the
+    # mean, and nothing in the report said so.
+    at_bounds: List[str] = field(default_factory=list)
+    n_points: int = 0
+    cgr_ceiling: float = float("nan")   # initial CGR, if one was supplied
+
+    @property
+    def warnings_(self) -> List[str]:
+        w: List[str] = []
+        if self.at_bounds:
+            pinned = ", ".join(self.at_bounds)
+            w.append(f"parameter(s) at a bound: {pinned}")
+            if "k" in self.at_bounds:
+                w.append("k is pinned at its floor, so the model is a "
+                         "CONSTANT CGR - it carries the current yield forward "
+                         "unchanged rather than declining it")
+        if np.isfinite(self.r2) and self.r2 <= 0.0:
+            w.append(f"R2 is {self.r2:.4f}: the fit is no better than a "
+                     "horizontal line through the mean, so the condensate "
+                     "forecast rests on a curve the data do not support")
+        if np.isfinite(self.cgr_ceiling) and self.cgr_ceiling > 0:
+            worst = max(self.cgr_i, self.cgr_min)
+            if worst > self.cgr_ceiling:
+                w.append(f"the fitted CGR ({worst:,.0f} STB/MMscf) is above "
+                         f"the initial CGR ({self.cgr_ceiling:,.0f}), which a "
+                         "depleting retrograde gas cannot reach - the fit is "
+                         "tracking the reported liquid, not the condensate")
+        return w
 
     def __call__(self, Gp: np.ndarray) -> np.ndarray:
         Gp = np.asarray(Gp, dtype=float)
@@ -2336,7 +2368,8 @@ class YieldModel:
                 f"  cgr_min   : {self.cgr_min:.2f} STB/MMscf\n"
                 f"  k         : {self.k:.5g} 1/MMscf\n"
                 f"  Gp_dew    : {self.Gp_dew:.1f} MMscf\n"
-                f"  R2        : {self.r2:.4f}")
+                f"  R2        : {self.r2:.4f}"
+                + "".join(f"\n  WARNING   : {w}" for w in self.warnings_))
 
 
 def fit_yield_model(Gp: np.ndarray, cgr: np.ndarray,
@@ -2401,6 +2434,17 @@ def fit_yield_model(Gp: np.ndarray, cgr: np.ndarray,
     x = best.x
     gdew = float(x[3]) if fit_break else float(Gp_dew or 0.0)
     ym = YieldModel(float(x[0]), float(x[1]), float(x[2]), gdew)
+    ym.n_points = int(len(Gp))
+
+    # Relative tolerance on the span of each bound, so a parameter that simply
+    # happens to sit near its limit is not confused with one the optimiser
+    # pushed there and held.
+    names_all = ["cgr_i", "cgr_min", "k"] + (["Gp_dew"] if fit_break else [])
+    for i, nm in enumerate(names_all):
+        width = max(abs(hi[i] - lo[i]), 1e-30)
+        if (abs(x[i] - lo[i]) <= 1e-6 * width
+                or abs(x[i] - hi[i]) <= 1e-6 * width):
+            ym.at_bounds.append(nm)
 
     pred = ym(Gp)
     ssr = float(np.sum((np.log(pred) - np.log(cgr)) ** 2))
@@ -5188,6 +5232,11 @@ def analyse_well(df: pd.DataFrame | ProductionData,
             gp_dew = float(np.interp(-pvt.p_dew, -pr[okp], data.Gp_ws[okp]))
     yield_model = fit_yield_model(data.Gp_ws, data.cgr, Gp_dew=gp_dew,
                                   fit_dewpoint_break=(gp_dew is None))
+    # The initial CGR is a physical ceiling on the produced ratio, so the
+    # yield fit can be checked against it instead of being reported as if the
+    # data were beyond question.
+    if pvt.initial_cgr and np.isfinite(pvt.initial_cgr):
+        yield_model.cgr_ceiling = float(pvt.initial_cgr)
 
     # -- material balance -------------------------------------------------
     matbal, matbal_note = None, ""
@@ -6642,6 +6691,26 @@ def run_self_tests(verbose: bool = True) -> bool:
     gpx = np.linspace(0, 30000, 60)
     cgrx = ym_true(gpx) * np.random.default_rng(2).lognormal(0, 0.04, 60)
     ymf = fit_yield_model(gpx, cgrx, Gp_dew=4000.0, fit_dewpoint_break=False)
+    check("a good yield fit raises no warnings",
+          not ymf.warnings_ and not ymf.at_bounds,
+          f"R2 {ymf.r2:.3f}, nothing pinned")
+    # A CGR that RISES cannot be fitted by a decaying exponential, so the
+    # optimiser drives k to its floor and returns a constant. That is a failed
+    # fit and it used to be reported as a fit, with a negative R2 printed
+    # beside it and no comment - which is how the condensate forecast on 8L
+    # came to rest on a flat line the data actively contradict.
+    rising = 100.0 * np.exp(1.5 * gpx / gpx[-1]) \
+        * np.random.default_rng(5).lognormal(0, 0.10, 60)
+    ym_bad = fit_yield_model(gpx, rising, Gp_dew=4000.0,
+                             fit_dewpoint_break=False)
+    ym_bad.cgr_ceiling = 78.0
+    w = " | ".join(ym_bad.warnings_)
+    check("a degenerate yield fit is flagged, not printed as a fit",
+          "k" in ym_bad.at_bounds and ym_bad.r2 <= 0 and len(ym_bad.warnings_) >= 3,
+          f"k pinned, R2 {ym_bad.r2:.3f}, {len(ym_bad.warnings_)} warning(s)")
+    check("a fitted CGR above the initial CGR is called out",
+          any("above the initial CGR" in x for x in ym_bad.warnings_),
+          w[:90])
     check("CGR yield model recovered",
           abs(ymf.cgr_i - 80) < 4 and abs(ymf.cgr_min - 25) < 4,
           f"cgr_i={ymf.cgr_i:.1f}, cgr_min={ymf.cgr_min:.1f}")
