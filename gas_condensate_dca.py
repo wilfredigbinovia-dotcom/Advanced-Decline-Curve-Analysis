@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "11.0"
+__version__ = "12.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -4319,6 +4319,8 @@ class Forecast:
     # only the first invites the reader to compare it with a forecast horizon
     # it is not on the same footing as.
     forecast_years: float = float("nan")
+    # Constraints that were ALREADY violated at the last historical record.
+    constraints_breached_at_start: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         return "\n".join([
@@ -4337,6 +4339,12 @@ class Forecast:
             f"    condensate       : {self.remaining_condensate_mstb:,.0f} Mstb",
             f"    plant NGL        : {self.remaining_ngl_mstb:,.0f} Mstb",
             f"  ended by           : {self.abandonment_reason}"
+            + ("" if not self.constraints_breached_at_start else
+               "\n    NOTE: "
+               + ", ".join(self.constraints_breached_at_start)
+               + " already exceeded at the last historical record - this is "
+                 "not a forecast of\n          remaining life, it is the "
+                 "statement that the limit has already been passed")
             + ("" if not self.constraint_years else
                "\n" + "\n".join(
                    f"    {k:<16} {v:,.1f} yr" for k, v in
@@ -4417,6 +4425,11 @@ def forecast_products(fit: FitResult,
     reason = "gas rate"
     constraint_years: Dict[str, float] = {"gas rate": t_ab / DAYS_PER_YEAR}
     cut_at = len(t)
+    # A constraint whose first violation is the FIRST forecast step is not a
+    # forecast of anything - the well is already past that limit today. The
+    # resulting "life" is just the last historical date, and quoting it as a
+    # forecast horizon invites the reader to think there is time left.
+    breached: List[str] = []
 
     if ogip_cap_mmscf is not None and np.isfinite(ogip_cap_mmscf):
         if ogip_cap_mmscf <= gp_to_date_mmscf:
@@ -4433,6 +4446,8 @@ def forecast_products(fit: FitResult,
         if over.size:
             constraint_years["gas in place"] = float(
                 t[max(int(over[0]) - 1, 0)] / DAYS_PER_YEAR)
+            if int(over[0]) == 0:
+                breached.append("gas in place")
             if int(over[0]) < cut_at:
                 cut_at, reason = int(over[0]), "gas in place"
 
@@ -4453,6 +4468,8 @@ def forecast_products(fit: FitResult,
             if hit.size:
                 constraint_years[label] = float(
                     t[max(int(hit[0]) - 1, 0)] / DAYS_PER_YEAR)
+                if int(hit[0]) == 0:
+                    breached.append(label)
                 if int(hit[0]) < cut_at:
                     cut_at, reason = int(hit[0]), label
             elif label == "water rate":
@@ -4523,6 +4540,7 @@ def forecast_products(fit: FitResult,
         q_water_last_stbd=(float(q_water[-1]) if len(q_water)
                            and np.isfinite(q_water[-1]) else float("nan")),
         forecast_years=float((t[-1] - t_start_days) / DAYS_PER_YEAR),
+        constraints_breached_at_start=breached,
     )
 
 
@@ -4542,6 +4560,9 @@ def monte_carlo_eur(fit: FitResult,
                     cgr_rel_sigma: float = 0.10,
                     ogip_cap_mmscf: Optional[float] = None,
                     ogip_cap_rel_sigma: float = 0.15,
+                    water_trend: Optional[WaterTrend] = None,
+                    q_water_econ_stbd: Optional[float] = None,
+                    water_cut_econ: Optional[float] = None,
                     max_rel_sd: float = 0.35,
                     seed: int = 11) -> pd.DataFrame:
     """Probabilistic EUR by sampling the fit covariance plus explicit priors.
@@ -4554,6 +4575,12 @@ def monte_carlo_eur(fit: FitResult,
         dmin_prior_pct_yr   (mean, sigma) effective terminal decline, %/yr
         cgr_rel_sigma       lognormal scatter on the whole CGR curve
         ogip_cap_rel_sigma  scatter on the volumetric/material-balance cap
+
+    The water trend and its limits are passed through to every realisation for
+    the same reason the gas economic limit is: a probabilistic EUR that ignores
+    a constraint the deterministic case honours is not a distribution around
+    that case, it is a distribution around a different well. Left out, the P90
+    can land ABOVE the deterministic answer, which is nonsense on its face.
         max_rel_sd          caps each parameter's sampled standard deviation at
                             this fraction of its value. Regression covariances
                             on production data are routinely enormous because
@@ -4640,7 +4667,10 @@ def monte_carlo_eur(fit: FitResult,
                                        t_start_days=t_start_days,
                                        t_max_years=t_max_years,
                                        products=products,
-                                       ogip_cap_mmscf=cap)
+                                       ogip_cap_mmscf=cap,
+                                       water_trend=water_trend,
+                                       q_water_econ_stbd=q_water_econ_stbd,
+                                       water_cut_econ=water_cut_econ)
             except Exception:
                 continue
 
@@ -4987,6 +5017,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
 
     # -- forecast ---------------------------------------------------------
     t_last = float(data.t[-1])
+    water_fc = water if water is not None and water.significant else None
     fc = forecast_products(best, yield_model, pvt, q_econ_mscfd,
                            gp_to_date_mmscf=float(data.Gp_ws[-1]),
                            np_to_date_mstb=float(data.Np_cond[-1]),
@@ -4995,8 +5026,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                            t_max_years=t_max_years,
                            products=products,
                            ogip_cap_mmscf=ogip_cap,
-                           water_trend=(water if water is not None
-                                        and water.significant else None),
+                           water_trend=water_fc,
                            q_water_econ_stbd=q_water_econ_stbd,
                            water_cut_econ=water_cut_econ)
 
@@ -5014,7 +5044,10 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                  b_prior=b_prior,
                                  dmin_prior_pct_yr=dmin_prior_pct_yr,
                                  ogip_cap_mmscf=ogip_cap,
-                                 ogip_cap_rel_sigma=ogip_choice.rel_sigma)
+                                 ogip_cap_rel_sigma=ogip_choice.rel_sigma,
+                                 water_trend=water_fc,
+                                 q_water_econ_stbd=q_water_econ_stbd,
+                                 water_cut_econ=water_cut_econ)
             mc_stats = {
                 "EUR wellstream gas (MMscf)":
                     percentiles_petroleum(mc["eur_wellstream_mmscf"]),
@@ -6360,6 +6393,44 @@ def run_self_tests(verbose: bool = True) -> bool:
     except Exception as exc:
         check("a forecast horizon shorter than the history stays forward",
               False, str(exc))
+
+    # 14 -- the Monte Carlo must obey every constraint the deterministic case
+    # obeys. It used to be handed the gas economic limit and the gas-in-place
+    # cap but NOT the water limits, so on a well that dies on water the P90
+    # came back ABOVE the deterministic EUR - a distribution around a
+    # different well entirely.
+    try:
+        df14 = make_synthetic_well(pvt, n_months=96, seed=7,
+                                   noise_frac=0.04, downtime_prob=0.05)
+        q_w14 = pd.to_numeric(df14["q_water"], errors="coerce").to_numpy(float)
+        w_lim = float(np.nanpercentile(q_w14, 60))    # bites mid-forecast
+        res14 = analyse_well(df14, pvt, well="WATER", verbose=False,
+                             run_monte_carlo=True, n_mc=300,
+                             q_water_econ_stbd=w_lim)
+        f14, s14 = res14.forecast, res14.mc_stats
+        if s14 is None:
+            check("Monte Carlo honours the water limit", False,
+                  "no Monte Carlo statistics returned")
+        else:
+            det = f14.eur_wellstream_mmscf
+            p90 = s14["EUR wellstream gas (MMscf)"]["P90"]
+            p10 = s14["EUR wellstream gas (MMscf)"]["P10"]
+            check("the deterministic EUR lies inside its own P90-P10",
+                  p90 <= det * 1.02 and det <= p10 * 1.02,
+                  f"P90 {p90:,.0f} <= det {det:,.0f} <= P10 {p10:,.0f}, "
+                  f"ended by {f14.abandonment_reason}")
+        # and the "already past the limit" flag fires when it should
+        f_past = forecast_products(
+            res14.best_fit, res14.yield_model, pvt, q_econ_mscfd=500.0,
+            gp_to_date_mmscf=float(res14.data.Gp_ws[-1]),
+            t_start_days=float(res14.data.t[-1]), t_max_years=20.0,
+            water_trend=f14.water_trend,
+            q_water_econ_stbd=float(np.nanmin(q_w14[q_w14 > 0])) * 0.5)
+        check("a limit already passed today is flagged, not sold as a life",
+              "water rate" in f_past.constraints_breached_at_start,
+              f"breached at start: {f_past.constraints_breached_at_start}")
+    except Exception as exc:
+        check("Monte Carlo honours the water limit", False, str(exc))
 
     if verbose:
         width = 62
