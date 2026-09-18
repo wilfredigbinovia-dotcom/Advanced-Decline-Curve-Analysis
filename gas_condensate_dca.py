@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "20.0"
+__version__ = "21.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2967,6 +2967,25 @@ class MaterialBalanceResult:
     impossible: bool = False
     p_initial: float = float("nan")
     p_initial_known: bool = False
+    # True when p_i did not come off a gauge but was BACK-EXTRAPOLATED from
+    # the early p/z trend by this module. Writing that value into the data as
+    # a survey and then fitting the p/z line through it is circular: the line
+    # is being fitted to a point the line itself produced. On 8L it moved the
+    # intercept 9 % and cut the quoted standard error by a third, which is an
+    # entirely manufactured gain in confidence.
+    p_initial_estimated: bool = False
+    # OGIP refitted with the EARLIEST survey dropped. The first point has the
+    # most leverage on an intercept by construction, so this says how much of
+    # the answer rests on it.
+    ogip_drop_first: float = float("nan")
+    r2_drop_first: float = float("nan")
+
+    @property
+    def first_point_leverage(self) -> float:
+        """Relative shift in OGIP when the earliest survey is dropped."""
+        if not (np.isfinite(self.ogip_drop_first) and self.ogip_mmscf > 0):
+            return float("nan")
+        return abs(self.ogip_drop_first - self.ogip_mmscf) / self.ogip_mmscf
     gp_now: float = float("nan")
     n_surveys: int = 0
     n_skipped: int = 0
@@ -2991,7 +3010,9 @@ class MaterialBalanceResult:
                  f"  surveys used      : {self.n_surveys}"
                  + (f" ({self.n_skipped} earliest dropped)" if self.n_skipped else ""),
                  f"  p_initial         : {self.p_initial:,.0f} psia "
-                 + ("(as entered)" if self.p_initial_known
+                 + ("(ESTIMATED by this tool, not measured)"
+                    if self.p_initial_estimated else
+                    "(as entered)" if self.p_initial_known
                     else "(extrapolated to zero cumulative)"),
                  f"  (p/z)_i           : {self.pz_i:,.1f} psia",
                  (f"  OGIP (p/z line)   : {self.ogip_mmscf:,.0f} MMscf "
@@ -2999,6 +3020,21 @@ class MaterialBalanceResult:
                   "  OGIP (p/z line)   : not available - the trend does not "
                   "decline"),
                  f"  R2                : {self.r2:.4f}"]
+        if np.isfinite(self.ogip_drop_first):
+            lev = self.first_point_leverage
+            if self.p_initial_estimated or lev > 0.10:
+                lines.append(
+                    f"  drop 1st survey   : OGIP {self.ogip_drop_first:,.0f} "
+                    f"MMscf (R2 {self.r2_drop_first:.4f}), a "
+                    f"{100 * lev:.0f} % shift")
+                if self.p_initial_estimated:
+                    lines.append(
+                        "  WARNING           : the earliest survey IS the "
+                        "estimated p_i, which was itself back-extrapolated\n"
+                        "                      from this same p/z trend. "
+                        "Fitting the line through it is circular - it tightens\n"
+                        "                      the quoted error without adding "
+                        "an independent measurement.")
         if self.pz_note:
             lines.append(f"  NOTE              : {self.pz_note}")
         if np.isfinite(self.ho_rise):
@@ -3139,7 +3175,9 @@ def material_balance_pz(pressure: np.ndarray,
                         cf: float = 4.0e-6,
                         cw: float = 3.0e-6,
                         bw: float = 1.0,
-                        min_depletion: float = 0.05) -> MaterialBalanceResult:
+                        min_depletion: float = 0.05,
+                        p_initial_estimated: bool = False
+                        ) -> MaterialBalanceResult:
     """Volumetric gas material balance, policed by Havlena-Odeh.
 
         p/z = (p/z)_i * (1 - Gp/G)      ->      G = -intercept / slope
@@ -3312,7 +3350,24 @@ def material_balance_pz(pressure: np.ndarray,
     gp_now = float(g[-1])
     impossible = bool(np.isfinite(ceiling) and gp_now > ceiling)
 
+    # How much of the intercept rests on the single earliest survey. That point
+    # always has the most leverage on an extrapolation to zero cumulative, and
+    # when it is an ESTIMATED p_i the leverage is on a number this module
+    # produced rather than on a measurement.
+    ogip_df = r2_df = float("nan")
+    if pz_trend_ok and len(g) >= 4:
+        try:
+            keep = np.argsort(g)[1:]          # drop the smallest cumulative
+            rr = stats.linregress(g[keep], pz[keep])
+            if rr.slope < 0:
+                ogip_df = float(-rr.intercept / rr.slope)
+                r2_df = float(rr.rvalue ** 2)
+        except Exception:
+            pass
+
     return MaterialBalanceResult(
+        ogip_drop_first=ogip_df, r2_drop_first=r2_df,
+        p_initial_estimated=bool(p_initial_estimated),
         ogip_mmscf=float(ogip), ogip_stderr=float(ogip_se),
         r2=float(res.rvalue ** 2), pz_i=float(res.intercept),
         method=("two-phase z" if two_phase else "single-phase z"),
@@ -5222,6 +5277,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                  dmin_prior_pct_yr: Optional[Tuple[float, float]] = None,
                  use_material_balance: bool = True,
                  mb_p_initial: Optional[float] = None,
+                 p_initial_estimated: bool = False,
                  mb_skip_early: int = 0,
                  use_aquifer: bool = True,
                  use_fmb: bool = False,
@@ -5338,7 +5394,8 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                     surv["p_res"].to_numpy(float),
                     surv["Gp_ws"].to_numpy(float), pvt,
                     water_mstb=(surv[wcol].to_numpy(float) if wcol else None),
-                    p_initial=mb_p_initial, skip_early=mb_skip_early)
+                    p_initial=mb_p_initial, skip_early=mb_skip_early,
+                    p_initial_estimated=p_initial_estimated)
                 matbal_note = (f"{matbal.n_surveys} pressure surveys used"
                                + (f", {matbal.n_skipped} earliest dropped."
                                   if matbal.n_skipped else "."))
@@ -6760,6 +6817,26 @@ def run_self_tests(verbose: bool = True) -> bool:
     pr = d_t.p_res
     okp = np.isfinite(pr)
     mb_t = material_balance_pz(pr[okp], d_t.Gp_ws[okp], pvt_cvd)
+    # The estimated p_i is BACK-EXTRAPOLATED from the p/z trend, so writing it
+    # into the data as a survey and refitting that same trend through it is
+    # circular. It must be labelled, and the leverage it carries must be shown.
+    mb_e = material_balance_pz(pr[okp], d_t.Gp_ws[okp], pvt_cvd,
+                               p_initial_estimated=True)
+    check("an estimated p_i is not reported as a measurement",
+          "ESTIMATED by this tool" in mb_e.summary()
+          and mb_e.p_initial_estimated, "provenance is carried into the report")
+    check("the leverage of the earliest survey is quantified",
+          np.isfinite(mb_e.ogip_drop_first)
+          and np.isfinite(mb_e.first_point_leverage)
+          and "drop 1st survey" in mb_e.summary(),
+          f"{mb_e.ogip_mmscf:,.0f} -> {mb_e.ogip_drop_first:,.0f} MMscf, "
+          f"{100 * mb_e.first_point_leverage:.0f} % shift")
+    mb_m = material_balance_pz(pr[okp], d_t.Gp_ws[okp], pvt_cvd)
+    check("a measured p_i is not warned about",
+          "circular" not in mb_m.summary()
+          and abs(mb_m.ogip_mmscf - mb_e.ogip_mmscf) < 1e-6,
+          "the flag changes the reporting, never the arithmetic")
+
     check("material balance recovers the simulated tank OGIP",
           abs(mb_t.ogip_mmscf / 52000.0 - 1) < 0.05,
           f"{mb_t.ogip_mmscf:,.0f} vs 52,000 MMscf "

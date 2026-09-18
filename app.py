@@ -601,7 +601,7 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
     (q_econ, model, terminal, t_max, run_mc, n_mc, use_mb, use_fmb, cap,
      rate_basis, min_uptime, outlier_sigma, fit_from_bdf, window,
      mb_pi, mb_skip, use_aq, ogip_mode, aquifer_model,
-     q_water_lim, wcut_lim) = settings
+     q_water_lim, wcut_lim, pi_estimated) = settings
     # No surface processing is applied, so "sales gas" is the separator gas and
     # plant NGL is zero. Both are reported on the separator-gas basis below.
     split = dca.ProductSplit(inert_fraction=0.0, fuel_flare_fraction=0.0,
@@ -638,7 +638,8 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
                 use_fmb=use_fmb,
                 apply_ogip_cap=cap, ogip_cap_mode=ogip_mode,
                 fit_from_bdf=fit_from_bdf,
-                fit_window_days=window, verbose=False)
+                fit_window_days=window, verbose=False,
+                p_initial_estimated=pi_estimated)
         except Exception as exc:
             errors[name] = str(exc)
 
@@ -1376,7 +1377,13 @@ settings = (q_econ, model_choice, terminal, float(t_max), run_mc, int(n_mc),
             use_mb, use_fmb, cap_ogip, rate_basis, min_uptime, outlier_sigma,
             auto_window, window, float(mb_pi), int(mb_skip), use_aq,
             ogip_mode, aquifer_model, float(q_water_lim),
-            float(wcut_lim))
+            float(wcut_lim),
+            # Whether the p_i sitting in the table was ESTIMATED by this tool
+            # rather than measured. It has to travel with the settings so the
+            # cached analysis is invalidated when it changes, and so the
+            # material balance can say that its earliest survey is its own
+            # extrapolation rather than an independent gauge reading.
+            bool(st.session_state.get("_pi_written") is not None))
 with st.spinner("Fitting declines, yield models and material balance..."):
     try:
         results, summary, profile, errors = run_analysis(
