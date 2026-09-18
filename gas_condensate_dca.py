@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "16.0"
+__version__ = "17.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -5022,7 +5022,19 @@ class WellResult:
         if self.mc_stats:
             out.append("-- Probabilistic EUR (P90 = low case) " + "-" * 40)
             for key, st in self.mc_stats.items():
-                out.append(f"  {key}")
+                # The caveat on the deterministic condensate EUR applies just
+                # as much here - the Monte Carlo samples the decline, the
+                # yield and the water trend, none of which knows the liquid
+                # stream is contaminated. Carrying the flag only on the
+                # deterministic block let the unqualified number out through
+                # this one.
+                flag = ""
+                if ("condensate" in key.lower() and lc is not None
+                        and lc.exceeds and np.isfinite(lc.implied_non_condensate)):
+                    flag = (f"   <-- REPORTED liquid; see the caveat above "
+                            f"({100 * lc.implied_non_condensate:.0f} % is not "
+                            "condensate)")
+                out.append(f"  {key}{flag}")
                 out.append(f"    P90 {st['P90']:>14,.0f} | P50 {st['P50']:>14,.0f} "
                            f"| P10 {st['P10']:>14,.0f}   (n={st['n']})")
             if self.mc is not None and "ended_by" in self.mc.columns:
