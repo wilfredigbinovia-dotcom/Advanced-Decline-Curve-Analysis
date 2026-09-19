@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "27.0"
+__version__ = "29.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2858,7 +2858,12 @@ class BankDiagnostic:
     def summary(self) -> str:
         if not self.ok:
             return f"  bank diagnostic   : not run ({self.reason})"
-        head = (f"  bank diagnostic   : PI fell {100 * self.loss_frac:,.0f} % "
+        # "PI fell -11 %" is a double negative that reads as a fall when the
+        # index ROSE. On a pressure-supported or still-cleaning-up well it
+        # rises, and that is a different finding, not a small one.
+        verb = "fell" if self.loss_frac >= 0 else "ROSE"
+        head = (f"  bank diagnostic   : PI {verb} "
+                f"{abs(100 * self.loss_frac):,.0f} % "
                 f"({self.pi_initial:,.3g} -> {self.pi_final:,.3g}), trend "
                 f"{self.trend_pct_per_year:+,.0f} %/yr "
                 f"(R2 {self.r2:.2f}, n={self.n_points})\n"
@@ -4003,6 +4008,7 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
 
 FETKOVICH_MAX_RMS_PCT = 5.0     # above this the pressure match is not a match
 FETKOVICH_MAX_WE_HCPV = 0.60    # influx larger than this much of HCPV is not credible
+FETKOVICH_MAX_WEI_RATIO = 100.0  # aquifer volume above this multiple of HCPV is not a fit
 
 
 def fetkovich_health(fk: Optional[Dict]) -> List[str]:
@@ -4029,6 +4035,29 @@ def fetkovich_health(fk: Optional[Dict]) -> List[str]:
         bad.append(f"it needs {100 * wef:,.0f} % of the hydrocarbon pore "
                    "volume to have been replaced by water, which is not a "
                    "reservoir, it is an optimiser running to its bounds")
+    # An aquifer thousands of times the reservoir it feeds is not a reservoir
+    # description - it is the optimiser saying "infinite-acting" and parking
+    # Wei wherever the trade-off against tau left it. Well 2L came back with
+    # Wei = 122,504 MMbbl against a hydrocarbon pore volume near 45: nothing
+    # in the report questioned it, because the influx itself (6 % of HCPV) was
+    # perfectly reasonable. Wei and We are different claims and only one of
+    # them was being checked.
+    wei = float(fk.get("Wei_mmbbl", float("nan")))
+    hcpv = float(fk.get("hcpv_mmbbl", float("nan")))
+    if not np.isfinite(hcpv):
+        we_mm = float(fk.get("We_mmbbl", float("nan")))
+        wef_ = float(fk.get("we_frac_hcpv", float("nan")))
+        if np.isfinite(we_mm) and np.isfinite(wef_) and wef_ > 0:
+            hcpv = we_mm / wef_
+    if np.isfinite(wei) and np.isfinite(hcpv) and hcpv > 0:
+        ratio = wei / hcpv
+        if ratio > FETKOVICH_MAX_WEI_RATIO:
+            bad.append(f"the aquifer it wants is {ratio:,.0f}x the "
+                       f"hydrocarbon pore volume ({wei:,.0f} against "
+                       f"{hcpv:,.0f} MMbbl). Wei is not identifiable here - "
+                       "it has traded off against tau and run away, so read "
+                       "the influx, not the aquifer size")
+
     g = float(fk.get("G_mmscf", float("nan")))
     lo, hi = fk.get("g_range_mmscf", (float("nan"), float("nan")))
     if np.isfinite(g) and np.isfinite(lo) and np.isfinite(hi) and hi > lo:
@@ -4437,6 +4466,7 @@ def aquifer_fit(t_days: np.ndarray,
         "locus_within": inside.reset_index(drop=True),
         "rms_threshold": thresh,
         "we_frac_hcpv": we_frac,
+        "hcpv_mmbbl": float(hcpv_res_bbl / 1.0e6),
         "g_range_mmscf": g_range,
         "J_eff_bbl_d_psi": j_eff,
     }
@@ -4950,6 +4980,29 @@ def forecast_products(fit: FitResult,
         reason = "max forecast life"
 
     cgr = yield_model(gp)                          # STB/MMscf
+
+    # A wellstream cannot be more than 100 % condensate. Since the wellstream
+    # IS separator gas plus the gas equivalent of the condensate, that puts a
+    # hard ceiling on the yield:
+    #
+    #     q_cond * v_eq <= q_ws        ->      cgr <= 1e6 / v_eq
+    #
+    # Nothing enforced it. On well 2L the yield fit - itself fitted to a
+    # mis-scaled liquid column and already flagged for it - returned
+    # cgr_i = 79,009 STB/MMscf against a ceiling of 1,210, and the forecast
+    # duly produced 647 Mstb of condensate out of 13 MMscf of wellstream gas.
+    # That is 41 times more condensate than there was stream to carry it.
+    cgr_ceiling = float(1.0e6 / max(pvt.v_eq, 1e-9))
+    n_over = int(np.sum(cgr > cgr_ceiling))
+    if n_over:
+        warnings.warn(
+            f"CGR clipped to the physical ceiling of {cgr_ceiling:,.0f} "
+            f"STB/MMscf on {n_over} of {len(cgr)} forecast steps (peak "
+            f"{np.max(cgr):,.0f}): a yield above that implies the wellstream "
+            "is more than 100 % condensate. The yield model, and the liquid "
+            "column behind it, are wrong.")
+        cgr = np.minimum(cgr, cgr_ceiling)
+
     q_cond = q_ws / MSCF_PER_MMSCF * cgr           # STB/d
 
     streams = products.apply(q_ws, q_cond, pvt.v_eq)
@@ -5262,6 +5315,28 @@ class WellResult:
             out += ["-- Produced water " + "-" * 60,
                     self.forecast.water_trend.summary(), ""]
         out += ["-- Deterministic forecast " + "-" * 52, self.forecast.summary()]
+        # How much of the EUR is extrapolation, set against how well the
+        # extrapolation is constrained. On 2L the forecast contributed 68 % of
+        # the EUR - more than twice the entire production history - from a
+        # 17-point fit with R2 of 0.015 and b pinned to a bound. Every one of
+        # those facts was in the report separately; nothing put them together.
+        eur_g = self.forecast.eur_wellstream_mmscf
+        rem_g = self.forecast.remaining_wellstream_mmscf
+        if eur_g > 0 and rem_g > 0:
+            share = rem_g / eur_g
+            shaky = bool(self.best_fit.at_bounds) or self.best_fit.r2 < 0.30
+            if share > 0.50 and shaky:
+                out += [
+                    "  WARNING on how much of this is extrapolation",
+                    f"    {100 * share:.0f} % of the EUR is forecast, not "
+                    f"history ({rem_g:,.0f} of {eur_g:,.0f} MMscf), and the",
+                    f"    fit behind it has R2 {self.best_fit.r2:.3f} on "
+                    f"{self.best_fit.n_points} points"
+                    + (f" with {', '.join(self.best_fit.at_bounds)} pinned to "
+                       "a bound." if self.best_fit.at_bounds else "."),
+                    "    The reserves are therefore mostly a statement about "
+                    "the model, not about the well.",
+                ]
         # The condensate EUR is built from the REPORTED liquid stream. When the
         # liquid check has already said that stream cannot be condensate, the
         # number above is a measurement of something else and printing it
@@ -5287,12 +5362,28 @@ class WellResult:
             ge = eur_c * (1.0 - clean) * self.pvt.v_eq / 1.0e3   # MMscf
             eur_g = self.forecast.eur_wellstream_mmscf
             if eur_g > 0:
-                out.append(
-                    f"    Knock-on: {ge:,.0f} MMscf of the wellstream EUR "
-                    f"({100 * ge / eur_g:.0f} %) is the gas equivalent of that")
-                out.append(
-                    "    same liquid, so the gas in place behind it is "
-                    "overstated by about as much.")
+                frac = ge / eur_g
+                if frac <= 1.0:
+                    out.append(
+                        f"    Knock-on: {ge:,.0f} MMscf of the wellstream EUR "
+                        f"({100 * frac:.0f} %) is the gas equivalent of that")
+                    out.append(
+                        "    same liquid, so the gas in place behind it is "
+                        "overstated by about as much.")
+                else:
+                    # Over 100 % is not a proportion, it is a contradiction:
+                    # the liquid's gas equivalent exceeds the whole wellstream.
+                    # 2L printed "170 %" as though that were a share of a
+                    # total, which reads like a large but ordinary number.
+                    out.append(
+                        f"    IMPOSSIBLE: the gas equivalent of that liquid is "
+                        f"{ge:,.0f} MMscf, which is {frac:.1f}x the ENTIRE")
+                    out.append(
+                        f"    wellstream EUR of {eur_g:,.0f} MMscf. A stream "
+                        "cannot carry more condensate than it")
+                    out.append(
+                        "    has volume. The rate or liquid column is "
+                        "mis-scaled - check the units before anything else.")
         out += [""]
         if not self.mc_stats and self.mc_note:
             out += ["-- Probabilistic EUR " + "-" * 57,
@@ -5357,6 +5448,22 @@ class WellResult:
                             "reserves.\n        The real uncertainty is the "
                             f"'{top}' limit itself, which is an input, not a "
                             "fitted\n        parameter - vary it directly.")
+                    elif spread < 0.05 and self.best_fit.at_bounds:
+                        # "gas rate" was excluded above, on the assumption that
+                        # a gas-rate ending means the decline is doing the
+                        # work. It does not when the decline is unidentifiable:
+                        # 2L had every parameter pinned, R2 of -0.007, and
+                        # still reported P90 725 / P10 726 - a 0.1 % band on a
+                        # fit that describes nothing.
+                        out.append(
+                            f"  NOTE: the P90-P10 spread is only "
+                            f"{100*spread:.1f} %, but the selected fit has "
+                            f"{', '.join(self.best_fit.at_bounds)} pinned to a "
+                            "bound\n        and R2 of "
+                            f"{self.best_fit.r2:.3f}. A narrow band around an "
+                            "unidentifiable fit is not\n        confidence - "
+                            "the sampler is exploring a model the data do not "
+                            "support.")
             out.append("")
         text = "\n".join(out)
         print(text, file=stream) if stream is not None else print(text)
@@ -6594,6 +6701,24 @@ def run_self_tests(verbose: bool = True) -> bool:
                        "J_bbl_d_psi": 2.8, "We_mmbbl": 7.7,
                        "rms_pct": 1.48, "we_frac_hcpv": 0.14,
                        "g_range_mmscf": (71054.0, 86058.0)}
+    # Wei and We are separate claims and only We was ever checked. An aquifer
+    # thousands of times the reservoir is the optimiser declaring the aquifer
+    # infinite, not a measurement - and a perfectly reasonable 6 % influx was
+    # enough to keep it out of every other health check.
+    fk_wei = {"rms_pct": 1.57, "we_frac_hcpv": 0.06, "We_mmbbl": 2.7,
+              "Wei_mmbbl": 122504.0, "G_mmscf": 55260.0,
+              "g_range_mmscf": (46567.0, 64400.0)}
+    fk_ok = {"rms_pct": 1.28, "we_frac_hcpv": 0.18, "We_mmbbl": 8.0,
+             "Wei_mmbbl": 108.0, "G_mmscf": 60308.0,
+             "g_range_mmscf": (55280.0, 66589.0)}
+    check("an aquifer far larger than its reservoir is caught",
+          len(fetkovich_health(fk_wei)) == 1
+          and "not identifiable" in fetkovich_health(fk_wei)[0],
+          "Wei 2,722x the hydrocarbon pore volume")
+    check("a credibly sized aquifer is not flagged for its size",
+          fetkovich_health(fk_ok) == [],
+          "Wei 2.4x HCPV passes")
+
     check("a healthy aquifer fit adds no warnings to the report",
           "aquifer fit -" not in mb_fk.summary()
           and "14 % of the hydrocarbon" in mb_fk.summary(),
@@ -7200,6 +7325,77 @@ def run_self_tests(verbose: bool = True) -> bool:
               and "negative water readings" in d_negw.qc.summary()
               and float(d_negw.df["Wp_water"].iloc[-1]) == 0.0,
               f"{d_negw.qc.n_negative_water} row(s) clipped to zero")
+
+        # (j) when most of the EUR is extrapolation AND the fit behind it is
+        # unidentifiable, the two facts have to be stated together. On 2L the
+        # forecast was 68 % of the EUR - more than twice the whole history -
+        # off a 17-point fit with R2 0.015 and b at a bound, and every piece
+        # of that sat in a different section of the report.
+        # A short, noisy, nearly flat history forecast a long way forward is
+        # the shape that does it: little history, an unidentifiable fit, and
+        # most of the EUR on the far side of the last data point.
+        rng_e = np.random.default_rng(12)
+        n_e = 30
+        df_ext = pd.DataFrame({
+            "date": pd.date_range("2022-01-01", periods=n_e, freq="MS"),
+            "well": "E",
+            "days_on": 30.4,
+            "q_gas": 9000.0 * rng_e.lognormal(0.0, 0.22, n_e),   # flat + noise
+            "q_cond": 9000.0 * 0.06 * rng_e.lognormal(0.0, 0.2, n_e),
+            "q_water": 5.0,
+        })
+        r_ext = analyse_well(df_ext, pvt, well="E", verbose=False,
+                             run_monte_carlo=False, t_max_years=40.0,
+                             q_econ_mscfd=50.0, apply_ogip_cap=False,
+                             use_material_balance=False, fit_from_bdf=False)
+        f_ext, bf = r_ext.forecast, r_ext.best_fit
+        share = (f_ext.remaining_wellstream_mmscf
+                 / max(f_ext.eur_wellstream_mmscf, 1e-9))
+        shaky = bool(bf.at_bounds) or bf.r2 < 0.30
+        check("a forecast-dominated EUR on a shaky fit is called out",
+              share > 0.50 and shaky
+              and "% of the EUR is forecast, not history" in r_ext.summary(),
+              f"{100 * share:.0f} % forecast, R2 {bf.r2:.3f}, "
+              f"pinned {bf.at_bounds or 'nothing'}")
+        check("a well whose EUR is mostly history gets no such warning",
+              "% of the EUR is forecast, not history" not in res.summary()
+              or (res.forecast.remaining_wellstream_mmscf
+                  / max(res.forecast.eur_wellstream_mmscf, 1e-9)) > 0.50,
+              "the warning is about extrapolation, not about every forecast")
+
+        # (h) THE invariant a wellstream basis imposes: the gas equivalent of
+        # the forecast condensate can never exceed the wellstream carrying it.
+        # Nothing enforced it, so a yield model fitted to a mis-scaled liquid
+        # column produced 647 Mstb of condensate out of 13 MMscf of gas on
+        # well 2L - 41x more liquid than there was stream to hold it.
+        df_u = df.copy()
+        df_u["q_gas"] = df_u["q_gas"] / 1000.0      # rate read in the wrong unit
+        res_u = analyse_well(df_u, pvt, well="U", verbose=False,
+                             run_monte_carlo=False, t_max_years=10.0)
+        f_u = res_u.forecast
+        ge_u = f_u.eur_condensate_mstb * pvt.v_eq / 1.0e3
+        ceil_cgr = 1.0e6 / pvt.v_eq
+        check("forecast condensate never outweighs its own wellstream",
+              ge_u <= f_u.eur_wellstream_mmscf * 1.001
+              and float(f_u.table["cgr_stb_per_mmscf"].max()) <= ceil_cgr * 1.001,
+              f"gas equivalent {ge_u:,.0f} of {f_u.eur_wellstream_mmscf:,.0f} "
+              f"MMscf, peak CGR "
+              f"{f_u.table['cgr_stb_per_mmscf'].max():,.0f} <= "
+              f"{ceil_cgr:,.0f} STB/MMscf")
+        check("an impossible liquid share is named, not shown as a percentage",
+              "IMPOSSIBLE" in res_u.summary()
+              or (res_u.liquid_check is not None
+                  and not res_u.liquid_check.exceeds)
+              or ge_u <= f_u.eur_wellstream_mmscf,
+              "over 100 % is a contradiction, not a proportion")
+        # (i) a productivity index that ROSE must not be reported as a fall.
+        bd_up = BankDiagnostic(ok=True, pi_initial=1.0, pi_final=1.2,
+                               loss_frac=-0.2, trend_pct_per_year=4.0,
+                               r2=0.5, n_points=8)
+        check("a productivity index that rose is not reported as a fall",
+              "ROSE" in bd_up.summary() and "-" not in
+              bd_up.summary().split("ROSE")[1][:6],
+              bd_up.summary().split("\n")[0].strip()[:70])
 
         # (g) the deterministic EUR must sit inside its own P90-P10. A b or
         # terminal-decline prior breaks that silently, because the Monte Carlo
