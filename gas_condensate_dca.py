@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "36.0"
+__version__ = "37.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2191,6 +2191,9 @@ class FitResult:
     bic: float
     t_fit: np.ndarray
     q_fit: np.ndarray
+    # Small-sample corrected AIC. Plain AIC under-penalises parameters at the
+    # point counts a post-plateau window leaves; the ranking uses this.
+    aicc: float = float("inf")
     t0: float = 0.0
     fixed: Dict[str, float] = field(default_factory=dict)
     at_bounds: List[str] = field(default_factory=list)
@@ -2241,7 +2244,8 @@ class FitResult:
                  f"({self.t0 / DAYS_PER_YEAR:.2f} yr on production)",
                  f"  R2 (log)  : {self.r2:.4f}",
                  f"  RMSE(log) : {self.rmse_log:.4f}",
-                 f"  AIC / BIC : {self.aic:.1f} / {self.bic:.1f}"]
+                 f"  AICc      : {self.aicc:.1f}   (AIC {self.aic:.1f} / "
+                 f"BIC {self.bic:.1f})"]
         for k, v in self.params.items():
             se = self.stderr.get(k, float("nan"))
             tag = " (fixed)" if k in self.fixed else ""
@@ -2440,6 +2444,15 @@ def fit_decline(t: np.ndarray,
     r2 = 1.0 - ssr / sst if sst > 0 else float("nan")
     aic = n * math.log(max(ssr / n, 1e-300)) + 2 * k
     bic = n * math.log(max(ssr / n, 1e-300)) + k * math.log(n)
+    # AICc. Plain AIC under-penalises parameters at small n, which is exactly
+    # the regime a post-plateau window lands in - 2L was ranked on 17 points
+    # with models carrying 3 and 4 free parameters, where the correction term
+    # 2k(k+1)/(n-k-1) is 2.4 and 3.3 against AIC gaps of a fifth of a point.
+    # The About tab has claimed AICc since it was written; the code computed
+    # AIC, so the ranking was systematically kinder to the bigger models than
+    # the documentation said.
+    aicc = (aic + (2.0 * k * (k + 1)) / (n - k - 1)
+            if n - k - 1 > 0 else float("inf"))
 
     # Covariance from the Jacobian, transformed back out of log space.
     stderr: Dict[str, float] = {p: float("nan") for p in cls.param_names}
@@ -2468,7 +2481,7 @@ def fit_decline(t: np.ndarray,
     return FitResult(model=mdl, model_name=cls.__name__,
                      params={p: pars[p] for p in cls.param_names},
                      stderr=stderr, cov=cov_full, n_points=n,
-                     rmse_log=rmse, r2=r2, aic=aic, bic=bic,
+                     rmse_log=rmse, r2=r2, aic=aic, bic=bic, aicc=aicc,
                      t_fit=t, q_fit=q, t0=t0, fixed=fixed,
                      at_bounds=at_bounds,
                      converged=bool(best.success), message=str(best.message))
@@ -2500,10 +2513,11 @@ def rank_models(t: np.ndarray, q: np.ndarray,
         # collapsed to zero, which is sepd with one more parameter. None of
         # that showed in a table whose only quality column said True.
         rows.append({"model": name, "R2_log": fr.r2, "RMSE_log": fr.rmse_log,
-                     "AIC": fr.aic, "BIC": fr.bic, "converged": fr.converged,
+                     "AICc": fr.aicc, "AIC": fr.aic, "BIC": fr.bic,
+                     "converged": fr.converged,
                      "at_bounds": ",".join(fr.at_bounds) if fr.at_bounds
                                   else "-"})
-    table = (pd.DataFrame(rows).sort_values("AIC").reset_index(drop=True)
+    table = (pd.DataFrame(rows).sort_values("AICc").reset_index(drop=True)
              if rows else pd.DataFrame())
     return table, fits
 
@@ -5486,7 +5500,7 @@ class WellResult:
                "\n".join(f"  {k:<28}: {v}" for k, v in
                          self.pvt.describe().items()),
                "",
-               "-- Model ranking (by AIC, lower is better) " + "-" * 35,
+               "-- Model ranking (by AICc, lower is better) " + "-" * 35,
                self.model_table.to_string(index=False) if not self.model_table.empty
                else "  (none)",
                "",
@@ -5816,12 +5830,13 @@ def analyse_well(df: pd.DataFrame | ProductionData,
         # collapsed to zero, which is sepd with one more parameter. None of
         # that showed in a table whose only quality column said True.
         rows.append({"model": name, "R2_log": fr.r2, "RMSE_log": fr.rmse_log,
-                     "AIC": fr.aic, "BIC": fr.bic, "converged": fr.converged,
+                     "AICc": fr.aicc, "AIC": fr.aic, "BIC": fr.bic,
+                     "converged": fr.converged,
                      "at_bounds": ",".join(fr.at_bounds) if fr.at_bounds
                                   else "-"})
     if not fits:
         raise RuntimeError(f"[{well}] no decline model could be fitted.")
-    table = pd.DataFrame(rows).sort_values("AIC").reset_index(drop=True)
+    table = pd.DataFrame(rows).sort_values("AICc").reset_index(drop=True)
 
     key = table.iloc[0]["model"] if select == "auto" else select
     requested = key
@@ -5856,12 +5871,12 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     # on modified_hyperbolic with b pinned at 2.
     rank = int(table.index[table["model"] == key][0]) + 1
     if select == "auto":
-        why = f"lowest AIC of {len(table)} candidates"
+        why = f"lowest AICc of {len(table)} candidates"
     elif requested != key:
         why = (f"'{requested}' was requested but did not fit; fell back to the "
                f"lowest-AIC model")
     else:
-        why = f"model set explicitly (AIC rank {rank} of {len(table)})"
+        why = f"model set explicitly (AICc rank {rank} of {len(table)})"
     clean = table[table["at_bounds"] == "-"]
     if best.at_bounds and len(clean) and clean.iloc[0]["model"] != key:
         why += (f" - NOTE: '{clean.iloc[0]['model']}' ranks "
@@ -7933,6 +7948,25 @@ def run_self_tests(verbose: bool = True) -> bool:
               == res_auto.model_table.iloc[0]["model"].replace("_", "")
               or "lowest AIC" in res_auto.best_fit.selection_note,
               res_auto.best_fit.selection_note[:70])
+
+        # The About tab has claimed AICc since it was written and the code
+        # computed plain AIC. At the point counts a post-plateau window leaves
+        # - 17 on 2L - the correction term is worth 2.4 to 3.3 against AIC
+        # gaps of a fifth of a point, so the ranking really was kinder to the
+        # bigger models than the documentation said.
+        tblc = res.model_table
+        ok_aicc = "AICc" in tblc.columns and tblc["AICc"].is_monotonic_increasing
+        pen_ok = True
+        for nm, fr_c in res.fits.items():
+            k_c = len(fr_c.params) - len(fr_c.fixed)
+            n_c = fr_c.n_points
+            want = (fr_c.aic + 2.0 * k_c * (k_c + 1) / (n_c - k_c - 1)
+                    if n_c - k_c - 1 > 0 else float("inf"))
+            pen_ok &= (abs(fr_c.aicc - want) < 1e-6
+                       or not np.isfinite(want))
+        check("models are ranked by AICc, as the About tab says",
+              ok_aicc and pen_ok and (tblc["AICc"] >= tblc["AIC"]).all(),
+              "the correction is computed, applied and sorts the table")
 
         check("the model ranking table exposes pinned parameters",
               "at_bounds" in tbl.columns
