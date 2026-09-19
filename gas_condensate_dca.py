@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "32.0"
+__version__ = "33.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2073,11 +2073,20 @@ def window_sensitivity(t: np.ndarray, q: np.ndarray,
                         t >= float(fit_start_days)))
     for frac, label in ((0.50, "last half"), (0.25, "last quarter")):
         windows.append((label, t >= t[-1] - frac * span))
+    seen: set = set()
     for label, m in windows:
-        if int(m.sum()) < min_points:
+        n_m = int(m.sum())
+        if n_m < min_points:
             continue
+        # Windows that happen to select the same points say the same thing
+        # twice. On 2L the fitted window and the "last quarter" both landed on
+        # the same 17 rows, and the table listed an identical line under two
+        # names - which reads like corroboration from an independent window.
+        if n_m in seen:
+            continue
+        seen.add(n_m)
         lr = stats.linregress(t[m] / DAYS_PER_YEAR, np.log(q[m]))
-        rows.append({"window": label, "n": int(m.sum()),
+        rows.append({"window": label, "n": n_m,
                      "trend_pct_yr": float(100.0 * (math.exp(lr.slope) - 1.0)),
                      "r2": float(lr.rvalue ** 2),
                      "p_value": float(lr.pvalue)})
@@ -5176,6 +5185,7 @@ def monte_carlo_eur(fit: FitResult,
                     cgr_rel_sigma: float = 0.10,
                     ogip_cap_mmscf: Optional[float] = None,
                     ogip_cap_rel_sigma: float = 0.15,
+                    ogip_cap_hard_max: Optional[float] = None,
                     water_trend: Optional[WaterTrend] = None,
                     q_water_econ_stbd: Optional[float] = None,
                     water_cut_econ: Optional[float] = None,
@@ -5275,6 +5285,15 @@ def monte_carlo_eur(fit: FitResult,
                 cap = None
                 if ogip_cap_mmscf is not None and np.isfinite(ogip_cap_mmscf):
                     cap = float(ogip_cap_mmscf * rng.lognormal(0, ogip_cap_rel_sigma))
+                    # The We >= 0 ceiling is not an estimate with a symmetric
+                    # error - it is min(F/Eg) over the surveys, an UPPER bound
+                    # that survey scatter biases LOW, never high. Sampling it
+                    # lognormally let 10 % of realisations sit above a number
+                    # the report calls a bound "no gas in place may exceed":
+                    # on 2L the P10 EUR came out 13 % above its own ceiling.
+                    if (ogip_cap_hard_max is not None
+                            and np.isfinite(ogip_cap_hard_max)):
+                        cap = min(cap, float(ogip_cap_hard_max))
                     cap = max(cap, gp_to_date_mmscf * 1.01)
                 fc = forecast_products(fr, ym, pvt, q_econ_mscfd,
                                        gp_to_date_mmscf=gp_to_date_mmscf,
@@ -5943,6 +5962,11 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                  dmin_prior_pct_yr=dmin_prior_pct_yr,
                                  ogip_cap_mmscf=ogip_cap,
                                  ogip_cap_rel_sigma=ogip_choice.rel_sigma,
+                                 ogip_cap_hard_max=(
+                                     matbal.g_ceiling_mmscf
+                                     if (matbal is not None
+                                         and np.isfinite(matbal.g_ceiling_mmscf))
+                                     else None),
                                  water_trend=water_fc,
                                  q_water_econ_stbd=q_water_econ_stbd,
                                  water_cut_econ=water_cut_econ)
@@ -7537,6 +7561,18 @@ def run_self_tests(verbose: bool = True) -> bool:
                        11000 * np.exp(-0.002 * (t_w - 56)))
         q_w = q_w * np.random.default_rng(5).lognormal(0.0, 0.05, 71)
         ws = window_sensitivity(t_w * 30.4375, q_w, 1796.0)
+        # Two windows that select the same points are not two windows. On 2L
+        # the fitted window and the "last quarter" landed on the same 17 rows
+        # and the table printed the identical line twice, which reads as
+        # corroboration from somewhere independent.
+        t_d = np.arange(52) * 30.4375
+        q_d = (10000.0 * np.exp(-0.0001 * t_d)
+               * np.random.default_rng(1).lognormal(0.0, 0.05, 52))
+        ws_d = window_sensitivity(t_d, q_d, t_d[-1] - 0.25 * (t_d[-1] - t_d[0]))
+        check("windows that select the same points are not listed twice",
+              ws_d["n"].is_unique,
+              f"{len(ws_d)} distinct windows, sizes {list(ws_d['n'])}")
+
         check("the trend is reported over several windows, not just one",
               len(ws) >= 3 and {"window", "n", "trend_pct_yr", "r2",
                                 "p_value"} <= set(ws.columns),
@@ -7621,6 +7657,30 @@ def run_self_tests(verbose: bool = True) -> bool:
               "ROSE" in bd_up.summary() and "-" not in
               bd_up.summary().split("ROSE")[1][:6],
               bd_up.summary().split("\n")[0].strip()[:70])
+
+        # (k) the We >= 0 ceiling is min(F/Eg) over the surveys: an UPPER bound
+        # that survey scatter biases low, never high. The Monte Carlo sampled
+        # it lognormally in both directions, so realisations sat above a number
+        # the report calls a bound nothing may exceed - on 2L the P10 EUR came
+        # back 13 % above its own ceiling.
+        d_c = ProductionData.prepare(df, pvt, well="C")
+        fit_c = fit_decline(*d_c.window(), model="modified_hyperbolic")
+        ym_c = fit_yield_model(d_c.Gp_ws, d_c.cgr)
+        gp0_c = float(d_c.Gp_ws[-1])
+        ceil_c = gp0_c * 1.20
+        over = {}
+        for tag, hard in (("unbounded", None), ("bounded", ceil_c)):
+            mc_c = monte_carlo_eur(
+                fit_c, ym_c, pvt, q_econ_mscfd=300.0,
+                gp_to_date_mmscf=gp0_c, t_start_days=float(d_c.t[-1]),
+                n_samples=400, t_max_years=40.0, ogip_cap_mmscf=ceil_c,
+                ogip_cap_rel_sigma=0.10, ogip_cap_hard_max=hard)
+            v_c = mc_c["eur_wellstream_mmscf"].to_numpy()
+            over[tag] = int(np.sum(v_c > ceil_c * 1.001))
+        check("no realisation may exceed the We>=0 ceiling",
+              over["bounded"] == 0 and over["unbounded"] > 0,
+              f"{over['unbounded']} of 400 breached it before the fix, "
+              f"{over['bounded']} after")
 
         # (g) the deterministic EUR must sit inside its own P90-P10. A b or
         # terminal-decline prior breaks that silently, because the Monte Carlo
