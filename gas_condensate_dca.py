@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "34.0"
+__version__ = "35.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -3923,12 +3923,27 @@ class OGIPChoice:
     reason: str = ""
     candidates: Dict[str, float] = field(default_factory=dict)
     clipped_to_ceiling: bool = False
+    # True when the cap IS the We >= 0 ceiling. v33 stopped the Monte Carlo
+    # sampling above that bound - correctly, since min(F/Eg) is an upper bound
+    # biased low by scatter - but the report went on quoting "+/-10 %" for a
+    # spread that now only runs downward, which overstates the upside of a
+    # number the same page calls a bound nothing may exceed.
+    sigma_one_sided: bool = False
+
+    @property
+    def sigma_text(self) -> str:
+        if self.sigma_one_sided:
+            return (f"-{100 * self.rel_sigma:.0f} % / +0 % in the Monte Carlo "
+                    "- the ceiling is an upper bound, so the sampling only "
+                    "runs downward")
+        return f"+/-{100 * self.rel_sigma:.0f} % in the Monte Carlo"
 
     def __repr__(self) -> str:
         if not np.isfinite(self.value):
             return f"<OGIPChoice none: {self.reason}>"
         return (f"<OGIPChoice {self.value:,.0f} MMscf from {self.source} "
-                f"+/-{100 * self.rel_sigma:.0f}%>")
+                f"{'-' if self.sigma_one_sided else '+/-'}"
+                f"{100 * self.rel_sigma:.0f}%>")
 
 
 def select_ogip(matbal: Optional["MaterialBalanceResult"],
@@ -4113,7 +4128,8 @@ def select_ogip(matbal: Optional["MaterialBalanceResult"],
         return OGIPChoice(reason="No usable gas in place; the forecast is not "
                                  "capped.", candidates=cands)
     return OGIPChoice(value=float(pick), source=src, rel_sigma=float(sig),
-                      reason=why, candidates=cands, clipped_to_ceiling=clipped)
+                      reason=why, candidates=cands, clipped_to_ceiling=clipped,
+                      sigma_one_sided=bool(clipped or "ceiling" in src.lower()))
 
 
 FETKOVICH_MAX_RMS_PCT = 5.0     # above this the pressure match is not a match
@@ -5494,8 +5510,7 @@ class WellResult:
             body = ("\n".join(lines) + "\n" if lines else "")
             if np.isfinite(oc.value):
                 body += (f"  cap applied       : {oc.value:,.0f} MMscf "
-                         f"({oc.source}, +/-{100 * oc.rel_sigma:.0f} % in the "
-                         f"Monte Carlo)\n")
+                         f"({oc.source}, {oc.sigma_text})\n")
             else:
                 body += "  cap applied       : none\n"
             body += f"  why               : {oc.reason}"
@@ -5997,9 +6012,17 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                  dmin_prior_pct_yr=dmin_prior_pct_yr,
                                  ogip_cap_mmscf=ogip_cap,
                                  ogip_cap_rel_sigma=ogip_choice.rel_sigma,
+                                 # Only truncate when the cap IS the ceiling.
+                                 # v33 passed it unconditionally, so a p/z or
+                                 # Fetkovich cap sitting inside the 5 % slack
+                                 # ABOVE the ceiling was sampled against a
+                                 # bound below its own deterministic value -
+                                 # every realisation capped lower than the
+                                 # point forecast it is supposed to bracket.
                                  ogip_cap_hard_max=(
                                      matbal.g_ceiling_mmscf
                                      if (matbal is not None
+                                         and ogip_choice.sigma_one_sided
                                          and np.isfinite(matbal.g_ceiling_mmscf))
                                      else None),
                                  water_trend=water_fc,
@@ -7740,6 +7763,25 @@ def run_self_tests(verbose: bool = True) -> bool:
                 ogip_cap_rel_sigma=0.10, ogip_cap_hard_max=hard)
             v_c = mc_c["eur_wellstream_mmscf"].to_numpy()
             over[tag] = int(np.sum(v_c > ceil_c * 1.001))
+        # ...but only when the cap IS the ceiling. The 5 % slack deliberately
+        # lets a p/z or Fetkovich cap sit just above min(F/Eg); truncating
+        # those at the ceiling sampled every realisation BELOW the
+        # deterministic cap they are meant to bracket.
+        oc_pz = select_ogip(material_balance_pz(p_syn, gp, pvt_cvd,
+                                                p_initial=pi), None, "pz")
+        oc_ce = select_ogip(material_balance_pz(p_syn, gp, pvt_cvd,
+                                                p_initial=pi), None, "ceiling")
+        check("only a ceiling cap samples one-sided",
+              oc_ce.sigma_one_sided
+              and (oc_pz.sigma_one_sided == oc_pz.clipped_to_ceiling),
+              f"ceiling one-sided={oc_ce.sigma_one_sided}, "
+              f"p/z one-sided={oc_pz.sigma_one_sided} "
+              f"(clipped={oc_pz.clipped_to_ceiling})")
+        check("a one-sided spread is not quoted as +/-",
+              "+/-" not in oc_ce.sigma_text and "+0 %" in oc_ce.sigma_text
+              and "+/-" in oc_pz.sigma_text or oc_pz.sigma_one_sided,
+              oc_ce.sigma_text[:60])
+
         check("no realisation may exceed the We>=0 ceiling",
               over["bounded"] == 0 and over["unbounded"] > 0,
               f"{over['unbounded']} of 400 breached it before the fix, "
