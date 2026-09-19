@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "26.0"
+__version__ = "27.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -5190,6 +5190,7 @@ class WellResult:
     forecast: Forecast
     mc: Optional[pd.DataFrame] = None
     mc_stats: Optional[Dict[str, Dict[str, float]]] = None
+    mc_note: str = ""
     matbal: Optional[MaterialBalanceResult] = None
     fmb: Optional[Dict[str, float]] = None
     ogip_choice: Optional[OGIPChoice] = None
@@ -5293,6 +5294,11 @@ class WellResult:
                     "    same liquid, so the gas in place behind it is "
                     "overstated by about as much.")
         out += [""]
+        if not self.mc_stats and self.mc_note:
+            out += ["-- Probabilistic EUR " + "-" * 57,
+                    "  not available: " + self.mc_note,
+                    "  The deterministic figures above therefore carry no "
+                    "range at all.", ""]
         if self.mc_stats:
             out.append("-- Probabilistic EUR (P90 = low case) " + "-" * 40)
             for key, st in self.mc_stats.items():
@@ -5311,6 +5317,24 @@ class WellResult:
                 out.append(f"  {key}{flag}")
                 out.append(f"    P90 {st['P90']:>14,.0f} | P50 {st['P50']:>14,.0f} "
                            f"| P10 {st['P10']:>14,.0f}   (n={st['n']})")
+            # The deterministic case must lie inside its own P90-P10. When it
+            # does not, the two are describing different wells - which is what
+            # a b or Dmin prior does silently, since the Monte Carlo samples
+            # the prior while the deterministic forecast keeps the fitted
+            # value. v12 fixed one cause of this (the water limit); this
+            # checks the invariant itself, whatever the cause.
+            _k = "EUR wellstream gas (MMscf)"
+            _st = self.mc_stats.get(_k)
+            if _st:
+                _det = self.forecast.eur_wellstream_mmscf
+                if _det < _st["P90"] * 0.98 or _det > _st["P10"] * 1.02:
+                    out.append(
+                        f"  WARNING: the deterministic EUR ({_det:,.0f} MMscf) "
+                        f"falls OUTSIDE its own P90-P10\n"
+                        f"           ({_st['P90']:,.0f}-{_st['P10']:,.0f}). The "
+                        "two are not describing the same well - the usual\n"
+                        "           cause is a b or terminal-decline prior "
+                        "that the deterministic fit does not use.")
             if self.mc is not None and "ended_by" in self.mc.columns:
                 mix = self.mc["ended_by"].value_counts(normalize=True)
                 out.append("  what ends each realisation: " + ", ".join(
@@ -5641,6 +5665,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
 
     # -- uncertainty ------------------------------------------------------
     mc = mc_stats = None
+    mc_note = ""
     if run_monte_carlo:
         try:
             mc = monte_carlo_eur(best, yield_model, pvt, q_econ_mscfd,
@@ -5666,11 +5691,17 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                     percentiles_petroleum(mc["eur_condensate_mstb"]),
             }
         except Exception as exc:
+            # The report used to simply omit the probabilistic section when
+            # this happened, so a Monte Carlo that never ran and one that was
+            # switched off looked exactly alike - and the reader was left with
+            # a single deterministic number and no idea a range was attempted.
+            mc_note = str(exc)
             warnings.warn(f"[{well}] Monte Carlo failed: {exc}")
 
     res = WellResult(well=well, data=data, pvt=pvt, model_table=table, fits=fits,
                      best_fit=best, yield_model=yield_model, forecast=fc,
-                     mc=mc, mc_stats=mc_stats, matbal=matbal, fmb=fmb,
+                     mc=mc, mc_stats=mc_stats, mc_note=mc_note,
+                     matbal=matbal, fmb=fmb,
                      ogip_choice=ogip_choice, liquid_check=liquid_check,
                      water_in_liquid=water_in_liquid, bank=bank,
                      settings={"q_econ_mscfd": q_econ_mscfd,
@@ -7169,6 +7200,36 @@ def run_self_tests(verbose: bool = True) -> bool:
               and "negative water readings" in d_negw.qc.summary()
               and float(d_negw.df["Wp_water"].iloc[-1]) == 0.0,
               f"{d_negw.qc.n_negative_water} row(s) clipped to zero")
+
+        # (g) the deterministic EUR must sit inside its own P90-P10. A b or
+        # terminal-decline prior breaks that silently, because the Monte Carlo
+        # samples the prior while the deterministic forecast keeps the fitted
+        # value - the same "two different wells" failure v12 fixed for the
+        # water limit, arriving by another route.
+        r_pri = analyse_well(df, pvt, well="P", verbose=False,
+                             run_monte_carlo=True, n_mc=300,
+                             b_prior=(0.2, 0.05))
+        if r_pri.mc_stats:
+            k_p = "EUR wellstream gas (MMscf)"
+            det_p = r_pri.forecast.eur_wellstream_mmscf
+            st_p = r_pri.mc_stats[k_p]
+            outside = det_p < st_p["P90"] * 0.98 or det_p > st_p["P10"] * 1.02
+            check("a deterministic EUR outside its own band is flagged",
+                  (not outside) or "falls OUTSIDE its own P90-P10"
+                  in r_pri.summary(),
+                  f"det {det_p:,.0f} vs P90-P10 {st_p['P90']:,.0f}-"
+                  f"{st_p['P10']:,.0f}; "
+                  + ("warned" if outside else "inside the band, no warning"))
+        # ...and a Monte Carlo that could not run must say so rather than
+        # leaving the section out, which looked identical to it being off.
+        r_nomc = analyse_well(df, pvt, well="N", verbose=False,
+                              run_monte_carlo=True, n_mc=300,
+                              dmin_prior_pct_yr=(0.01, 0.001))
+        check("a Monte Carlo that cannot run explains itself",
+              (r_nomc.mc_stats is not None)
+              or (bool(r_nomc.mc_note)
+                  and "not available" in r_nomc.summary()),
+              (r_nomc.mc_note or "it ran")[:70])
 
         # (f) `skip_early` was clamped by the material balance but NOT by the
         # aquifer fit beside it, so an over-large value gave the two different
