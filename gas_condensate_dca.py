@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "33.0"
+__version__ = "34.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -4917,9 +4917,12 @@ class Forecast:
     forecast_years: float = float("nan")
     # Constraints that were ALREADY violated at the last historical record.
     constraints_breached_at_start: List[str] = field(default_factory=list)
+    # Fraction of the gas-in-place cap the forecast reaches. 1.0 means it bound.
+    cap_fraction_reached: float = float("nan")
 
     def summary(self) -> str:
-        return "\n".join([
+        # A None entry is dropped, so an optional line can be written inline.
+        return "\n".join(x for x in [
             f"  economic life      : {self.economic_life_years:.1f} yr "
             f"(from first production)"
             + ("" if not np.isfinite(self.forecast_years) else
@@ -4934,6 +4937,10 @@ class Forecast:
             f"    sales gas        : {self.remaining_sales_gas_mmscf:,.0f} MMscf",
             f"    condensate       : {self.remaining_condensate_mstb:,.0f} Mstb",
             f"    plant NGL        : {self.remaining_ngl_mstb:,.0f} Mstb",
+            (f"  gas in place       : the forecast ends at "
+             f"{100 * self.cap_fraction_reached:.1f} % of the cap"
+             if np.isfinite(self.cap_fraction_reached)
+             and self.abandonment_reason != "gas in place" else None),
             f"  ended by           : {self.abandonment_reason}"
             + ("" if not self.constraints_breached_at_start else
                "\n    NOTE: "
@@ -4943,9 +4950,15 @@ class Forecast:
                  "statement that the limit has already been passed")
             + ("" if not self.constraint_years else
                "\n" + "\n".join(
-                   f"    {k:<16} {v:,.1f} yr" for k, v in
-                   sorted(self.constraint_years.items(), key=lambda kv: kv[1]))),
-        ])
+                   (f"    {k:<16} never reached"
+                    if not np.isfinite(v) else
+                    f"    {k:<16} {v:,.1f} yr"
+                    + ("  (beyond the forecast horizon)"
+                       if np.isfinite(self.economic_life_years)
+                       and v > self.economic_life_years + 1e-6 else ""))
+                   for k, v in sorted(self.constraint_years.items(),
+                                      key=lambda kv: kv[1]))),
+        ] if x is not None)
 
 
 def forecast_products(fit: FitResult,
@@ -5024,8 +5037,20 @@ def forecast_products(fit: FitResult,
     # when it does not bind, because knowing a well drowns in three years and
     # dies on rate in thirteen is the whole point of looking.
     reason = "gas rate" if rate_limit_on else "max forecast life"
-    constraint_years: Dict[str, float] = ({"gas rate": t_ab / DAYS_PER_YEAR}
-                                          if rate_limit_on else {})
+    # `t_ab` has already been CLAMPED to the horizon, so quoting it as the
+    # gas-rate date reports the horizon under the wrong name. Well 2L listed
+    # "gas rate 16.1 yr" on a 10-year horizon over a 6.1-year history: 6.1+10,
+    # the clamp, not a rate ever reached. The water limits have always
+    # reported when they WOULD bind beyond the forecast; the gas rate did not.
+    constraint_years: Dict[str, float] = {}
+    if rate_limit_on:
+        t_rate_true = model.time_to_rate(
+            q_econ_mscfd, t_max=200.0 * DAYS_PER_YEAR)
+        if np.isfinite(t_rate_true):
+            constraint_years["gas rate"] = float(
+                t_rate_true / DAYS_PER_YEAR)
+        else:
+            constraint_years["gas rate"] = float("inf")
     cut_at = len(t)
     # A constraint whose first violation is the FIRST forecast step is not a
     # forecast of anything - the well is already past that limit today. The
@@ -5044,6 +5069,12 @@ def forecast_products(fit: FitResult,
                 f"cumulative production {gp_to_date_mmscf:,.0f} MMscf; the cap "
                 "is wrong, not the well - check p_i, the survey pressures and "
                 "the wellstream conversion.")
+        # How close the forecast came to the cap, whether or not it hit it.
+        # On 2L the run ended at 99.9 % of a cap that governed 69 % of the
+        # Monte Carlo realisations, and "gas in place" appeared nowhere in the
+        # deterministic constraint list - because the list only records a
+        # constraint that actually bound.
+        cap_reached = float(gp[-1] / ogip_cap_mmscf) if ogip_cap_mmscf else 0.0
         over = np.flatnonzero(gp > ogip_cap_mmscf)
         if over.size:
             constraint_years["gas in place"] = float(
@@ -5166,6 +5197,10 @@ def forecast_products(fit: FitResult,
                            and np.isfinite(q_water[-1]) else float("nan")),
         forecast_years=float((t[-1] - t_start_days) / DAYS_PER_YEAR),
         constraints_breached_at_start=breached,
+        cap_fraction_reached=(float(gp[-1] / ogip_cap_mmscf)
+                              if ogip_cap_mmscf is not None
+                              and np.isfinite(ogip_cap_mmscf)
+                              and ogip_cap_mmscf > 0 else float("nan")),
     )
 
 
@@ -7657,6 +7692,34 @@ def run_self_tests(verbose: bool = True) -> bool:
               "ROSE" in bd_up.summary() and "-" not in
               bd_up.summary().split("ROSE")[1][:6],
               bd_up.summary().split("\n")[0].strip()[:70])
+
+        # (l) `t_ab` is clamped to the horizon before the constraint list is
+        # built, so the gas-rate entry quoted the horizon under the constraint's
+        # name. Well 2L listed "gas rate 16.1 yr" on a 10-year horizon over a
+        # 6.1-year history: 6.1 + 10, a clamp, not a rate ever reached.
+        r_h = analyse_well(df, pvt, well="H", verbose=False,
+                           run_monte_carlo=False, t_max_years=1.0,
+                           q_econ_mscfd=100.0, apply_ogip_cap=False)
+        f_h = r_h.forecast
+        gas_yr = f_h.constraint_years.get("gas rate", float("nan"))
+        check("the gas-rate limit is not reported as the horizon",
+              f_h.abandonment_reason == "max forecast life"
+              and (not np.isfinite(gas_yr)
+                   or gas_yr > f_h.economic_life_years + 1e-6),
+              f"life {f_h.economic_life_years:.1f} yr (horizon), gas rate "
+              + ("never reached" if not np.isfinite(gas_yr)
+                 else f"{gas_yr:.1f} yr"))
+        check("a constraint beyond the horizon is labelled as such",
+              (not np.isfinite(gas_yr))
+              or "beyond the forecast horizon" in f_h.summary(),
+              "the reader can tell a real date from an unreached one")
+        # ...and the cap has to appear even when it does not bind, because it
+        # can govern the distribution while sitting out of the point forecast.
+        check("how close the forecast came to the cap is reported",
+              (not np.isfinite(res.forecast.cap_fraction_reached))
+              or "% of the cap" in res.forecast.summary()
+              or res.forecast.abandonment_reason == "gas in place",
+              f"{100 * res.forecast.cap_fraction_reached:.1f} % of the cap")
 
         # (k) the We >= 0 ceiling is min(F/Eg) over the surveys: an UPPER bound
         # that survey scatter biases low, never high. The Monte Carlo sampled
