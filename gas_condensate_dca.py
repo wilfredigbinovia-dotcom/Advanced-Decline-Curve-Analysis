@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "35.0"
+__version__ = "36.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -5446,6 +5446,32 @@ class WellResult:
                          "the window starts, not of")
             lines.append("             the well. Settle the window before "
                          "quoting any reserve.")
+        else:
+            # The sign-flip test only fires when two significant windows
+            # disagree. It misses the case that actually occurs: the window
+            # BEING USED has no signal at all while another one does. On 2L
+            # the fitted window reads -1.5 %/yr at p = 0.64 - nothing - while
+            # the last half reads -3.8 %/yr at p = 0.037, the only real trend
+            # in the record, and the fit throws it away by starting later.
+            used = ws[ws["window"].str.startswith("fitted window")]
+            others = ws[~ws["window"].str.startswith("fitted window")]
+            if len(used) and len(others):
+                p_used = float(used["p_value"].iloc[0])
+                best = others.loc[others["p_value"].idxmin()]
+                if p_used > 0.10 and float(best["p_value"]) < 0.05:
+                    lines.append(
+                        "    WARNING: the window being fitted shows no "
+                        f"significant trend (p {p_used:.2g}), but")
+                    lines.append(
+                        f"             '{best['window']}' does "
+                        f"({best['trend_pct_yr']:+.1f} %/yr, "
+                        f"p {float(best['p_value']):.2g}). The fit start is")
+                    lines.append(
+                        "             discarding the only decline signal in "
+                        "the record - check that the")
+                    lines.append(
+                        "             plateau really ended where the detector "
+                        "says it did.")
         return "\n".join(lines)
 
     def summary(self, stream=None) -> str:
@@ -7638,6 +7664,36 @@ def run_self_tests(verbose: bool = True) -> bool:
                         f"{r['trend_pct_yr']:+.1f}%/yr"
                         for _, r in ws.iterrows()))
         sig_w = ws[ws["p_value"] < 0.10]
+        # The sign-flip test misses the case that actually occurs: the window
+        # BEING FITTED has no signal while another window does. On 2L the
+        # fitted window reads p = 0.64 - nothing - while the last half reads
+        # p = 0.037, the only real trend in the record, discarded by starting
+        # the fit later.
+        rng_x = np.random.default_rng(4)
+        t_x = np.arange(52)
+        q_x = np.where(t_x < 26, 11000.0, 11000.0 * np.exp(-0.0032 * (t_x - 26)))
+        q_x = q_x * rng_x.lognormal(0.0, 0.055, 52)
+        df_x = pd.DataFrame({
+            "date": pd.date_range("2020-01-01", periods=52, freq="MS"),
+            "well": "W", "days_on": 30.4, "q_gas": q_x,
+            "q_cond": q_x * 0.054, "q_water": 5.0})
+        d_x = ProductionData.prepare(df_x, pvt, well="W")
+        r_x = analyse_well(df_x, pvt, well="W", verbose=False,
+                           run_monte_carlo=False, t_max_years=10.0,
+                           use_material_balance=False,
+                           fit_window_days=(float(d_x.t[-14]), None))
+        ws_x = window_sensitivity(d_x.t, d_x.q_ws, d_x.qc.fit_start_days)
+        used_x = ws_x[ws_x["window"].str.startswith("fitted window")]
+        oth_x = ws_x[~ws_x["window"].str.startswith("fitted window")]
+        triggers = (len(used_x) and len(oth_x)
+                    and float(used_x["p_value"].iloc[0]) > 0.10
+                    and float(oth_x["p_value"].min()) < 0.05)
+        check("a window that discards the only real trend is called out",
+              (not triggers)
+              or "discarding the only decline signal" in r_x.summary(),
+              f"fitted p {float(used_x['p_value'].iloc[0]):.2g} vs best other "
+              f"p {float(oth_x['p_value'].min()):.2g}")
+
         check("a trend that changes sign between windows is called out",
               len(sig_w) >= 2 and sig_w["trend_pct_yr"].max() > 0
               > sig_w["trend_pct_yr"].min(),
