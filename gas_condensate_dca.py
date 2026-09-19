@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "31.0"
+__version__ = "32.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2040,6 +2040,48 @@ def diagnose_b(t: np.ndarray, q: np.ndarray,
     b = np.gradient(_smooth(np.nan_to_num(inv_D, nan=np.nanmean(inv_D)),
                             smooth_window), t)
     return pd.DataFrame({"t": t, "q": q, "D": D_s, "inv_D": inv_D, "b": b})
+
+
+def window_sensitivity(t: np.ndarray, q: np.ndarray,
+                       fit_start_days: Optional[float] = None,
+                       min_points: int = 6) -> pd.DataFrame:
+    """The plain rate trend over several candidate fitting windows.
+
+    The single biggest lever on a decline forecast is where the window starts,
+    and nothing in this report showed how much the answer moved when it did.
+    Well 2L makes the case: over the window this module chose - the 17 points
+    after the plateau - the trend is -1.5 %/yr at p = 0.64, i.e. nothing. Over
+    the WHOLE record OFM fits the same well at +2.4 %/yr and books ten years of
+    reserves on a rising line. Neither tool is wrong about its own window; the
+    disagreement is the window, and a reader could not see that.
+
+    Returns one row per window with the log-linear trend, its R2 and p-value,
+    so a forecast that depends on the choice is visible as such.
+    """
+    t = np.asarray(t, float)
+    q = np.asarray(q, float)
+    ok = np.isfinite(t) & np.isfinite(q) & (q > 0)
+    t, q = t[ok], q[ok]
+    rows: List[Dict[str, object]] = []
+    if len(t) < min_points:
+        return pd.DataFrame(columns=["window", "n", "trend_pct_yr", "r2",
+                                     "p_value"])
+    span = float(t[-1] - t[0])
+    windows: List[Tuple[str, np.ndarray]] = [("full record", t >= t[0])]
+    if fit_start_days is not None and np.isfinite(fit_start_days):
+        windows.append((f"fitted window (from day {fit_start_days:,.0f})",
+                        t >= float(fit_start_days)))
+    for frac, label in ((0.50, "last half"), (0.25, "last quarter")):
+        windows.append((label, t >= t[-1] - frac * span))
+    for label, m in windows:
+        if int(m.sum()) < min_points:
+            continue
+        lr = stats.linregress(t[m] / DAYS_PER_YEAR, np.log(q[m]))
+        rows.append({"window": label, "n": int(m.sum()),
+                     "trend_pct_yr": float(100.0 * (math.exp(lr.slope) - 1.0)),
+                     "r2": float(lr.rvalue ** 2),
+                     "p_value": float(lr.pvalue)})
+    return pd.DataFrame(rows)
 
 
 def detect_decline_start(t: np.ndarray, q: np.ndarray,
@@ -5311,6 +5353,31 @@ class WellResult:
     bank: Optional[BankDiagnostic] = None
     settings: Dict = field(default_factory=dict)
 
+    def _window_block(self) -> str:
+        """How much the trend depends on where the window starts."""
+        try:
+            ws = window_sensitivity(self.data.t, self.data.q_ws,
+                                    self.data.qc.fit_start_days)
+        except Exception:
+            return ""
+        if ws is None or len(ws) < 2:
+            return ""
+        lines = ["", "  window check: the same rate trend over other windows"]
+        for _, r in ws.iterrows():
+            lines.append(f"    {str(r['window']):<34} {r['trend_pct_yr']:+7.1f} "
+                         f"%/yr  (n={int(r['n']):>3}, R2 {r['r2']:.3f}, "
+                         f"p {r['p_value']:.2g})")
+        sig = ws[ws["p_value"] < 0.10]
+        if len(sig) and (sig["trend_pct_yr"].max() > 0
+                         > sig["trend_pct_yr"].min()):
+            lines.append("    WARNING: the trend changes SIGN between windows "
+                         "that are each significant.")
+            lines.append("             The forecast is a consequence of where "
+                         "the window starts, not of")
+            lines.append("             the well. Settle the window before "
+                         "quoting any reserve.")
+        return "\n".join(lines)
+
     def summary(self, stream=None) -> str:
         out = [f"{'=' * 78}",
                f" WELL {self.well}",
@@ -5328,7 +5395,8 @@ class WellResult:
                else "  (none)",
                "",
                "-- Selected decline fit " + "-" * 54,
-               self.best_fit.summary(),
+               self.best_fit.summary()
+               + self._window_block(),
                "",
                "-- Condensate yield " + "-" * 58,
                self.yield_model.summary(),
@@ -7459,6 +7527,29 @@ def run_self_tests(verbose: bool = True) -> bool:
                               run_monte_carlo=False, t_max_years=10.0,
                               use_material_balance=False, fit_from_bdf=False)
         bf_r = r_rise.best_fit
+        # Where the window starts is the biggest lever on a decline forecast,
+        # and nothing showed how far the answer moved when it changed. On 2L
+        # this module reads -1.5 %/yr over its 17-point window (p = 0.64) and
+        # OFM reads +2.4 %/yr over the whole record. Both are right about
+        # their own window; the report has to show that is what is happening.
+        t_w = np.arange(71)
+        q_w = np.where(t_w < 56, 9800 * np.exp(0.004 * t_w),
+                       11000 * np.exp(-0.002 * (t_w - 56)))
+        q_w = q_w * np.random.default_rng(5).lognormal(0.0, 0.05, 71)
+        ws = window_sensitivity(t_w * 30.4375, q_w, 1796.0)
+        check("the trend is reported over several windows, not just one",
+              len(ws) >= 3 and {"window", "n", "trend_pct_yr", "r2",
+                                "p_value"} <= set(ws.columns),
+              ", ".join(f"{r['window'].split(' (')[0]} "
+                        f"{r['trend_pct_yr']:+.1f}%/yr"
+                        for _, r in ws.iterrows()))
+        sig_w = ws[ws["p_value"] < 0.10]
+        check("a trend that changes sign between windows is called out",
+              len(sig_w) >= 2 and sig_w["trend_pct_yr"].max() > 0
+              > sig_w["trend_pct_yr"].min(),
+              "a sign flip across significant windows means the window is "
+              "the answer")
+
         check("a rising rate is named, not reported as a slow decline",
               bf_r.rate_is_rising and bf_r.trend_pct_per_year > 0
               and "the rate is RISING" in bf_r.summary(),
