@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "29.0"
+__version__ = "31.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -2148,6 +2148,35 @@ class FitResult:
     # Why this fit is the one being forecast on. Blank for fits that were only
     # ranked; set on the selected one.
     selection_note: str = ""
+    # The plain log-linear trend through the fitted window, before any decline
+    # model is imposed. Every Arps-family model this module offers is bounded
+    # to Di >= 0, so a well whose rate is RISING cannot be represented: the
+    # optimiser returns Di at or near zero with an R2 of nothing, and the
+    # report describes a failed fit rather than the thing that caused it.
+    # OFM, with no such bound, fits well 2L at Di = -0.024 - the rate climbs
+    # 2.4 %/yr - and then books ten years of reserves on a rising line.
+    trend_pct_per_year: float = float("nan")
+    trend_r2: float = float("nan")
+    trend_p_value: float = float("nan")
+
+    @property
+    def rate_is_rising(self) -> bool:
+        return bool(np.isfinite(self.trend_pct_per_year)
+                    and self.trend_pct_per_year > 0.5
+                    and np.isfinite(self.trend_p_value)
+                    and self.trend_p_value < 0.10)
+
+    @property
+    def weak_params(self) -> List[str]:
+        """Free parameters whose one-sigma is wider than the value itself."""
+        out: List[str] = []
+        for k, v in self.params.items():
+            if k in self.fixed or k in self.at_bounds:
+                continue
+            se = self.stderr.get(k, float("nan"))
+            if np.isfinite(se) and abs(v) > 0 and se >= abs(v):
+                out.append(k)
+        return out
 
     def predict(self, t: np.ndarray) -> np.ndarray:
         return self.model.rate(np.asarray(t, dtype=float))
@@ -2167,6 +2196,14 @@ class FitResult:
             tag = " (fixed)" if k in self.fixed else ""
             if k in self.at_bounds:
                 tag += "  <-- AT BOUND"
+            elif (k not in self.fixed and np.isfinite(se) and abs(v) > 0
+                  and se >= abs(v)):
+                # A one-sigma wider than the value itself means the parameter
+                # is not distinguishable from zero. On 2L that was the DECLINE
+                # RATE - Di = 4.06e-05 +/- 9.25e-05 - which is the statement
+                # that this well shows no measurable decline at all, and it
+                # was only visible if you divided the two numbers yourself.
+                tag += "  <-- NOT DISTINGUISHABLE FROM ZERO"
             lines.append(f"  {k:<10}: {v:.6g} +/- {se:.3g}{tag}")
         if "Di" in self.params:
             d_eff = 1.0 - math.exp(-self.params["Di"] * DAYS_PER_YEAR)
@@ -2184,6 +2221,28 @@ class FitResult:
                 lines.append("  WARNING   : parameter(s) pinned to a bound - the fit "
                              "is not identifiable; narrow the\n                window, "
                              "fix a parameter, or use a different model.")
+        if np.isfinite(self.trend_pct_per_year):
+            lines.append(
+                f"  raw trend : {self.trend_pct_per_year:+.1f} %/yr over the "
+                f"fitted window (R2 {self.trend_r2:.3f}, "
+                f"p {self.trend_p_value:.2g})")
+        if self.rate_is_rising:
+            lines.append(
+                "  WARNING   : the rate is RISING over the fitted window, not "
+                "declining. Every model\n                here is bounded to a "
+                "non-negative decline, so none of them can represent that -\n"
+                "                the near-zero Di and the low R2 are that "
+                "bound being hit, not a slow\n                decline. A well "
+                "that is still building up, or that has had compression or\n"
+                "                well work, needs the cause understood before "
+                "any decline is extrapolated.")
+        if "Di" in self.params and self.weak_params and "Di" in self.weak_params:
+            lines.append(
+                "  WARNING   : the decline rate itself is not distinguishable "
+                "from zero, so this\n                well shows no measurable "
+                "decline over the fitted window. Any forecast\n                "
+                "decline is coming from the terminal Dmin you assumed, not "
+                "from the data.")
         return "\n".join(lines)
 
 
@@ -5294,8 +5353,21 @@ class WellResult:
         if self.ogip_choice is not None:
             oc = self.ogip_choice
             lines = []
+            # A candidate that was REJECTED has to say so beside its number.
+            # On 2L the Fetkovich G was listed at 55,260 MMscf with no mark
+            # while the cap fell back to the ceiling, so the list read as
+            # though a perfectly good candidate had been passed over for no
+            # reason - the reason was three lines away, in the health check.
+            fk_bad = fetkovich_health((self.matbal.fetkovich
+                                       if self.matbal else None) or None)
             for k, v in (oc.candidates or {}).items():
-                mark = "  <-- used" if k == oc.source else ""
+                if k == oc.source or (oc.clipped_to_ceiling
+                                      and k in str(oc.source)):
+                    mark = "  <-- used"
+                elif k == "Fetkovich" and fk_bad:
+                    mark = "  <-- rejected, see the aquifer health warning"
+                else:
+                    mark = ""
                 lines.append(f"    {k:<16}: {v:>12,.0f} MMscf{mark}")
             body = ("\n".join(lines) + "\n" if lines else "")
             if np.isfinite(oc.value):
@@ -5593,6 +5665,23 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     if key not in fits:
         key = table.iloc[0]["model"]
     best = fits[key]
+
+    # The model-free trend through the same points every model was fitted to.
+    # Attach it to all of them, so the ranking table and the selected fit are
+    # describing data whose direction is on the record.
+    for _fr in fits.values():
+        try:
+            _m = (np.isfinite(_fr.t_fit) & np.isfinite(_fr.q_fit)
+                  & (_fr.q_fit > 0))
+            if int(_m.sum()) >= 4:
+                _lr = stats.linregress(_fr.t_fit[_m] / DAYS_PER_YEAR,
+                                       np.log(_fr.q_fit[_m]))
+                _fr.trend_pct_per_year = float(
+                    100.0 * (math.exp(_lr.slope) - 1.0))
+                _fr.trend_r2 = float(_lr.rvalue ** 2)
+                _fr.trend_p_value = float(_lr.pvalue)
+        except Exception:
+            pass
 
     # Say WHY this model is the one being forecast on. The ranking table sits
     # directly above the selected fit in the report, and when the selection is
@@ -7352,6 +7441,51 @@ def run_self_tests(verbose: bool = True) -> bool:
         share = (f_ext.remaining_wellstream_mmscf
                  / max(f_ext.eur_wellstream_mmscf, 1e-9))
         shaky = bool(bf.at_bounds) or bf.r2 < 0.30
+        # A well whose rate is RISING cannot be represented by any model here,
+        # since all of them are bounded to a non-negative decline. The fit
+        # answers by pinning Di at its floor and reporting an R2 of nothing,
+        # which describes the failure instead of its cause. OFM, unbounded,
+        # fits well 2L at Di = -0.024 and books ten years of reserves on a
+        # line that climbs - which is exactly why the cause has to be named.
+        rng_r = np.random.default_rng(7)
+        n_r = 36
+        q_r = (10000.0 * np.exp(0.024 * np.arange(n_r) / 12.0)
+               * rng_r.lognormal(0.0, 0.05, n_r))
+        df_r = pd.DataFrame({
+            "date": pd.date_range("2020-07-01", periods=n_r, freq="MS"),
+            "well": "R", "days_on": 30.4, "q_gas": q_r,
+            "q_cond": q_r * 0.05, "q_water": 5.0})
+        r_rise = analyse_well(df_r, pvt, well="R", verbose=False,
+                              run_monte_carlo=False, t_max_years=10.0,
+                              use_material_balance=False, fit_from_bdf=False)
+        bf_r = r_rise.best_fit
+        check("a rising rate is named, not reported as a slow decline",
+              bf_r.rate_is_rising and bf_r.trend_pct_per_year > 0
+              and "the rate is RISING" in bf_r.summary(),
+              f"raw trend {bf_r.trend_pct_per_year:+.1f} %/yr "
+              f"(p {bf_r.trend_p_value:.2g}) while Di pinned at "
+              f"{bf_r.params.get('Di', float('nan')):.2g}")
+        check("a genuinely declining well is not called rising",
+              not res.best_fit.rate_is_rising
+              and res.best_fit.trend_pct_per_year < 0,
+              f"raw trend {res.best_fit.trend_pct_per_year:+.1f} %/yr")
+
+        # A one-sigma wider than the parameter means it is not distinguishable
+        # from zero. On 2L that parameter was Di - the decline rate - so the
+        # well showed no measurable decline at all, and the only way to see it
+        # was to divide 4.06e-05 by 9.25e-05 yourself.
+        bf_w = r_ext.best_fit
+        if "Di" in bf_w.weak_params:
+            check("a decline rate indistinguishable from zero is named",
+                  "NOT DISTINGUISHABLE FROM ZERO" in bf_w.summary()
+                  and "no measurable decline" in bf_w.summary(),
+                  f"Di {bf_w.params['Di']:.3g} +/- "
+                  f"{bf_w.stderr.get('Di', float('nan')):.3g}")
+        check("a well-determined parameter is not flagged",
+              "NOT DISTINGUISHABLE" not in res.best_fit.summary()
+              or bool(res.best_fit.weak_params),
+              "the flag follows the standard error, not the model")
+
         check("a forecast-dominated EUR on a shaky fit is called out",
               share > 0.50 and shaky
               and "% of the EUR is forecast, not history" in r_ext.summary(),
