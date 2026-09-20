@@ -601,7 +601,7 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
     (q_econ, model, terminal, t_max, run_mc, n_mc, use_mb, use_fmb, cap,
      rate_basis, min_uptime, outlier_sigma, fit_from_bdf, window,
      mb_pi, mb_skip, use_aq, ogip_mode, aquifer_model,
-     q_water_lim, wcut_lim, pi_estimated) = settings
+     q_water_lim, wcut_lim, mb_efw, mb_sw, mb_cf, pi_estimated) = settings
     # No surface processing is applied, so "sales gas" is the separator gas and
     # plant NGL is zero. Both are reported on the separator-gas basis below.
     split = dca.ProductSplit(inert_fraction=0.0, fuel_flare_fraction=0.0,
@@ -631,7 +631,10 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
                 products=split, run_monte_carlo=run_mc, n_mc=n_mc,
                 use_material_balance=use_mb,
                 mb_p_initial=(mb_pi if mb_pi and mb_pi > 0 else None),
-                mb_skip_early=int(mb_skip), use_aquifer=use_aq,
+                mb_skip_early=int(mb_skip),
+                mb_include_efw=bool(mb_efw), mb_sw=float(mb_sw),
+                mb_cf_per_psi=float(mb_cf) * 1e-6,
+                use_aquifer=use_aq,
                 aquifer_model=aquifer_model,
                 q_water_econ_stbd=(q_water_lim if q_water_lim > 0 else None),
                 water_cut_econ=(wcut_lim / 100.0 if wcut_lim > 0 else None),
@@ -804,11 +807,17 @@ with st.sidebar:
              "24 years on production.")
 
     with st.expander("QC thresholds"):
-        rate_basis = st.radio("Rate basis", ["stream-day", "calendar-day"],
-                              horizontal=True,
-                              help="Mixing the two across a history is the "
-                                   "commonest source of fake hyperbolic "
-                                   "curvature.")
+        rate_basis = st.radio(
+            "Rate basis", ["stream-day", "calendar-day", "volume"],
+            horizontal=True,
+            help="What the gas/condensate/water columns actually hold. "
+                 "**stream-day** — a rate over the days the well ran. "
+                 "**calendar-day** — a rate over the whole period. "
+                 "**volume** — the period volume itself, from which rates are "
+                 "computed as volume / days-on. Allocation exports often carry "
+                 "monthly volumes; read as a rate, every volume is multiplied "
+                 "by the on-stream days a second time and the uptime swing "
+                 "goes straight into the decline.")
         min_uptime = st.slider("Min uptime fraction", 0.0, 0.9, 0.35, 0.05)
         outlier_sigma = st.slider("Outlier rejection (MAD sigma, 0 = off)",
                                   0.0, 8.0, 4.0, 0.5)
@@ -851,6 +860,31 @@ with st.sidebar:
             "Drop earliest surveys", 0, 20, 0, 1,
             help="Use this when the consistency guard fires and the first "
                  "survey predates a reliable reference.")
+        # Rock and connate-water expansion. Off by default, as before, but
+        # now reachable: these values were previously module defaults that no
+        # one using this app could see or change, and the p/z line ignored
+        # the term entirely. On an overpressured reservoir that reads G high
+        # by tens of percent while the line stays straight.
+        mb_efw = st.toggle(
+            "Correct p/z for rock and water expansion", value=False,
+            help="Ramagost-Farshad. Leave off for a normally pressured gas "
+                 "reservoir, where gas compressibility dwarfs the rock and "
+                 "the connate water. Turn it ON if the reservoir is "
+                 "overpressured: the uncorrected p/z line has no Efw term at "
+                 "all, so it stays perfectly straight and reads high. The "
+                 "material balance reports the size of the correction either "
+                 "way, so you can see whether it matters here before "
+                 "deciding.")
+        c_efw1, c_efw2 = st.columns(2)
+        mb_sw = c_efw1.number_input("Sw for Efw", 0.0, 0.7, 0.25, 0.01,
+                                    disabled=not mb_efw)
+        mb_cf = c_efw2.number_input("cf, 1e-6 /psi", 1.0, 60.0, 4.0, 0.5,
+                                    disabled=not mb_efw,
+                                    help="3-6 for a consolidated sandstone; "
+                                         "15-40 in an overpressured or "
+                                         "unconsolidated formation, which is "
+                                         "where this correction earns its "
+                                         "keep.")
         cap_ogip = st.toggle("Cap forecast at material-balance OGIP",
                              value=True)
         OGIP_MODES = {"Auto (by drive)": "auto", "p/z line": "p/z",
@@ -1377,7 +1411,7 @@ settings = (q_econ, model_choice, terminal, float(t_max), run_mc, int(n_mc),
             use_mb, use_fmb, cap_ogip, rate_basis, min_uptime, outlier_sigma,
             auto_window, window, float(mb_pi), int(mb_skip), use_aq,
             ogip_mode, aquifer_model, float(q_water_lim),
-            float(wcut_lim),
+            float(wcut_lim), bool(mb_efw), float(mb_sw), float(mb_cf),
             # Whether the p_i sitting in the table was ESTIMATED by this tool
             # rather than measured. It has to travel with the settings so the
             # cached analysis is invalidated when it changes, and so the
@@ -1611,6 +1645,31 @@ with tabs[3]:
                     f"{mb.ho_rise:.2f}×" if np.isfinite(mb.ho_rise) else "n/a")
         k[3].metric("Drive", mb.drive.title())
         k[4].metric("Produced", f"{mb.gp_now:,.0f} MMscf")
+
+        # The size of the rock and connate-water term, whether or not it was
+        # applied. A p/z line has no Efw in it, so on an abnormally pressured
+        # reservoir it stays straight and reads high - which is exactly the
+        # case where nothing else on this tab would tell you.
+        if np.isfinite(mb.efw_shift_frac):
+            if mb.efw_applied:
+                st.success(
+                    f"**Rock and water expansion applied** (Ramagost-Farshad, "
+                    f"c_e = {1e6 * mb.efw_ce_per_psi:.1f}×10⁻⁶ /psi). Without "
+                    f"it the same surveys give "
+                    f"{mb.ogip_mmscf * (1 + mb.efw_shift_frac):,.0f} MMscf — "
+                    f"{100 * mb.efw_shift_frac:+.0f} %.")
+            elif abs(mb.efw_shift_frac) >= 0.05:
+                st.warning(
+                    f"**The OGIP above ignores rock and connate-water "
+                    f"expansion, and here that is worth "
+                    f"{100 * mb.efw_shift_frac:+.0f} %.** Corrected it is "
+                    f"{mb.ogip_efw_mmscf:,.0f} MMscf at R² "
+                    f"{mb.r2_efw:.4f}. A p/z line carries no Efw term, so on "
+                    f"an overpressured reservoir it stays perfectly straight "
+                    f"and reads high — the expansion the rock and the water "
+                    f"supplied is credited to gas that is not there. Check "
+                    f"cf and Sw in the sidebar and turn the correction on if "
+                    f"this reservoir is overpressured.")
 
         if np.isfinite(mb.ogip_mmscf) and mb.ogip_mmscf > 0 and np.isfinite(
                 mb.ogip_stderr):
@@ -2174,6 +2233,9 @@ with tabs[8]:
         "| Drive mechanism | assumed volumetric | **Havlena-Odeh F/Eg**, the "
         "**We ≥ 0 ceiling**, and a **Fetkovich** or **Carter-Tracy** "
         "aquifer fit |\n"
+        "| Rock and water expansion | left out of p/z entirely | "
+        "**Ramagost-Farshad** correction, and the size of the term reported "
+        "whether or not it is applied |\n"
         "| Condensate bank | ignored | **Fevang-Whitson two-phase "
         "pseudo-pressure** m*(p) from your CVD dropout column |\n"
         "| Reserves bound | none | forecast **capped** at an independently "
@@ -2341,7 +2403,30 @@ with tabs[8]:
         "drop out in the reservoir and stay there, so the produced "
         "condensate-gas ratio falls away from its initial value and cannot "
         "climb back past it. Above the dew point it sits *at* that value. "
-        "Either way the initial CGR is a hard ceiling on the produced CGR, "
+        "#### Rock and connate-water expansion\n\n"
+        "A p/z line contains no Efw term. For a normally pressured gas "
+        "reservoir that is fine — gas compressibility dwarfs the rock and the "
+        "connate water — and leaving it out is what makes F/Eg equal G "
+        "exactly for a closed tank. When the reservoir is **overpressured** "
+        "it stops being fine, because at 9,000 psia the gas is already dense "
+        "and its compressibility has fallen to where the rock's is "
+        "comparable. The expansion the rock and the water supplied is then "
+        "credited to gas that is not there.\n\n"
+        "The failure is quiet, which is the point. On tanks marched with a "
+        "known G of 500 MMscf and the term present, the uncorrected line "
+        "returned 585, 673 and 897 MMscf at c_f = 12, 25 and 40×10⁻⁶ /psi — "
+        "**up to 79 % high, at R² 0.992 to 0.999, with the drive verdict "
+        "reading *volumetric* every time**, and the We ≥ 0 ceiling inflated "
+        "by the same amount so it offered no protection either.\n\n"
+        "The correction is exact rather than approximate: "
+        "`G(Eg + Efw) = Gp·Bg` rearranges to "
+        "`(p/z)(1 − c_e·Δp) = (p/z)_i (1 − Gp/G)`, so the corrected p/z is "
+        "still a straight line. On those same tanks it recovers G to 0.0 % at "
+        "R² 1.000000. It is computed on every run whether or not you switch "
+        "it on, and the material balance tab reports what it would change — "
+        "so the question of whether it matters on your reservoir is answered "
+        "from your data rather than by a default.\n\n"
+                "Either way the initial CGR is a hard ceiling on the produced CGR, "
         "and the fluid report already on file is enough to test it.\n\n"
         "A produced ratio above that ceiling is not reservoir behaviour. It "
         "is usually water the separator never split out, a test that measured "

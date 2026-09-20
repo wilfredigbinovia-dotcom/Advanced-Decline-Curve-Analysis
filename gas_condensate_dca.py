@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "37.0"
+__version__ = "40.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -1292,17 +1292,45 @@ class ProductionData:
             qc.notes.append("No uptime column; assumed fully on-stream.")
         d["uptime_frac"] = d["days_on"] / d["period_days"]
 
-        # Volumes for the period, from the rate as supplied (assumed stream-day
-        # if an uptime column exists, otherwise calendar-day).
+        # Period volumes first, then rates from them. Which of the two the
+        # input column holds is the `rate_basis` question, and it has three
+        # answers, not two:
+        #
+        #   stream-day     the column is a rate over the days the well ran
+        #   calendar-day   the column is a rate over the whole period
+        #   volume         the column is the PERIOD VOLUME itself
+        #
+        # The third was missing, and it is an easy column to mislabel: an
+        # allocation export that carries monthly volumes read as stream-day
+        # rates multiplies every volume by the on-stream days a second time,
+        # and - worse than a clean factor - injects the 0.2-to-31-day uptime
+        # swing straight into the rate series the decline is fitted to.
         eff_days = d["days_on"].where(d["days_on"] > 0, d["period_days"])
-        d["vol_gas"] = d["q_gas"] * eff_days                    # Mscf
-        d["vol_cond"] = d["q_cond"].fillna(0.0) * eff_days      # STB
-
-        if rate_basis == "calendar-day":
-            d["q_gas"] = d["vol_gas"] / d["period_days"]
-            d["q_cond"] = d["vol_cond"] / d["period_days"]
-        elif rate_basis != "stream-day":
-            raise ValueError("rate_basis must be 'stream-day' or 'calendar-day'.")
+        if rate_basis == "volume":
+            d["vol_gas"] = d["q_gas"].astype(float)                 # Mscf
+            d["vol_cond"] = d["q_cond"].fillna(0.0).astype(float)   # STB
+            d["q_gas"] = d["vol_gas"] / eff_days
+            d["q_cond"] = d["vol_cond"] / eff_days
+            if "q_water" in d.columns:
+                _vw = pd.to_numeric(d["q_water"], errors="coerce")
+                d["vol_water"] = _vw                                 # STB
+                d["q_water"] = _vw / eff_days
+            qc.notes.append(
+                "Input read as PERIOD VOLUMES; rates are volume / days-on.")
+        else:
+            d["vol_gas"] = d["q_gas"] * eff_days                    # Mscf
+            d["vol_cond"] = d["q_cond"].fillna(0.0) * eff_days      # STB
+            if "q_water" in d.columns:
+                d["vol_water"] = pd.to_numeric(
+                    d["q_water"], errors="coerce") * eff_days
+            if rate_basis == "calendar-day":
+                d["q_gas"] = d["vol_gas"] / d["period_days"]
+                d["q_cond"] = d["vol_cond"] / d["period_days"]
+                if "q_water" in d.columns:
+                    d["q_water"] = d["vol_water"] / d["period_days"]
+            elif rate_basis != "stream-day":
+                raise ValueError("rate_basis must be 'stream-day', "
+                                 "'calendar-day' or 'volume'.")
 
         # -- screening ------------------------------------------------------
         nonfinite = (~np.isfinite(d["q_gas"])).sum()
@@ -1350,18 +1378,30 @@ class ProductionData:
         d["q_ge"] = pvt.condensate_to_gas_equiv(d["q_cond"].to_numpy())
         d["q_ws"] = d["q_gas"] + d["q_ge"]
 
-        eff = d["days_on"].where(d["days_on"] > 0, d["period_days"])
-        d["Gp_sep"] = np.cumsum(d["q_gas"] * eff) / MSCF_PER_MMSCF       # MMscf
-        d["Gp_ws"] = np.cumsum(d["q_ws"] * eff) / MSCF_PER_MMSCF         # MMscf
-        d["Np_cond"] = np.cumsum(d["q_cond"] * eff) / 1.0e3              # Mstb
+        # Cumulatives come from the PERIOD VOLUMES computed above, never from
+        # the rate re-multiplied by the days. The volume a well produced in a
+        # month is a fact; it cannot depend on whether you choose to express
+        # that month as a stream-day or a calendar-day rate. It did: on 8L the
+        # same file gave 17,869 MMscf on a stream-day basis and 15,351 on a
+        # calendar-day basis, a 14 % swing in the number the material balance,
+        # the cap and the EUR all rest on, from a display choice.
+        d["vol_ge"] = pvt.condensate_to_gas_equiv(
+            d["vol_cond"].to_numpy(float))                             # Mscf
+        d["Gp_sep"] = np.cumsum(d["vol_gas"]) / MSCF_PER_MMSCF         # MMscf
+        d["Gp_ws"] = np.cumsum(
+            d["vol_gas"] + d["vol_ge"]) / MSCF_PER_MMSCF               # MMscf
+        d["Np_cond"] = np.cumsum(d["vol_cond"]) / 1.0e3                # Mstb
         if "q_water" in d.columns:
             _qw = pd.to_numeric(d["q_water"], errors="coerce").fillna(0.0)
             # Negative water is clipped, which is right, but it was clipped in
             # silence. A sign error or a bad meter is worth knowing about when
             # the water trend is what ends the well.
             qc.n_negative_water = int((_qw < 0).sum())
+            _vw = pd.to_numeric(d.get("vol_water"), errors="coerce")
+            if _vw is None or not np.isfinite(_vw.to_numpy(float)).any():
+                _vw = _qw * eff_days
             d["Wp_water"] = np.cumsum(
-                _qw.clip(lower=0.0) * eff) / 1.0e3                        # Mstb
+                _vw.fillna(0.0).clip(lower=0.0)) / 1.0e3                # Mstb
         with np.errstate(divide="ignore", invalid="ignore"):
             d["cgr"] = np.where(d["q_gas"] > 0,
                                 d["q_cond"] / (d["q_gas"] / MSCF_PER_MMSCF),
@@ -2556,10 +2596,27 @@ class YieldModel:
     n_points: int = 0
     cgr_ceiling: float = float("nan")   # initial CGR, if one was supplied
     gp_dew_note: str = ""
+    # True when the reservoir never fell below the dew point over the record.
+    # A wet gas produces an unchanging yield by definition, so k at its floor
+    # and an R2 near zero are then the right answer and must not be reported
+    # as a failed fit.
+    flat_is_expected: bool = False
+    ceiling_tolerance: float = 1.05
 
     @property
     def warnings_(self) -> List[str]:
         w: List[str] = []
+        if self.flat_is_expected:
+            # Above the dew point the yield is constant by definition. A flat
+            # fit is the answer, not a failure, and saying otherwise sends the
+            # reader hunting for a problem that is physics.
+            return ([f"the reservoir stayed above its dew point over the whole "
+                     f"record, so a constant CGR near {self.cgr_i:,.0f} "
+                     "STB/MMscf is the expected result - no yield decline has "
+                     "started yet"]
+                    if ("k" in self.at_bounds
+                        or (np.isfinite(self.r2) and self.r2 <= 0.05))
+                    else [])
         if self.at_bounds:
             pinned = ", ".join(self.at_bounds)
             w.append(f"parameter(s) at a bound: {pinned}")
@@ -2573,7 +2630,7 @@ class YieldModel:
                      "forecast rests on a curve the data do not support")
         if np.isfinite(self.cgr_ceiling) and self.cgr_ceiling > 0:
             worst = max(self.cgr_i, self.cgr_min)
-            if worst > self.cgr_ceiling:
+            if worst > self.cgr_ceiling * self.ceiling_tolerance:
                 w.append(f"the fitted CGR ({worst:,.0f} STB/MMscf) is above "
                          f"the initial CGR ({self.cgr_ceiling:,.0f}), which a "
                          "depleting retrograde gas cannot reach - the fit is "
@@ -2593,7 +2650,8 @@ class YieldModel:
                 f"  Gp_dew    : {self.Gp_dew:,.1f} MMscf"
                 + (f"  ({self.gp_dew_note})" if self.gp_dew_note else "") + "\n"
                 f"  R2        : {self.r2:.4f}"
-                + "".join(f"\n  WARNING   : {w}" for w in self.warnings_))
+                + "".join(f"\n  {'NOTE' if self.flat_is_expected else 'WARNING'}"
+                          f"      : {w}" for w in self.warnings_))
 
 
 def gp_at_dewpoint(surveys: pd.DataFrame, p_dew: Optional[float],
@@ -2764,19 +2822,35 @@ class LiquidCheck:
     n_periods: int = 0
     by_year: Optional[pd.DataFrame] = None
     reason: str = ""
+    # The ceiling is an EQUALITY above the dew point, not an inequality, so a
+    # measured ratio scatters either side of 1.0. `exceeds` compared against
+    # 1.0 exactly and ignored the tolerance that was already being passed in,
+    # so a clean wet gas - constant CGR, nothing dropping out anywhere -
+    # reported "1.0x the initial, which a depleting retrograde gas cannot do"
+    # and an implied contamination of a couple of per cent that was noise.
+    tolerance: float = 1.05
+    # True when no survey ever fell below the dew point: a wet gas, or a
+    # condensate still above it. The yield is then EXPECTED to be flat.
+    above_dew_throughout: bool = False
 
     @property
     def exceeds(self) -> bool:
         return bool(self.ok and np.isfinite(self.ratio_recent)
-                    and self.ratio_recent > 1.0)
+                    and self.ratio_recent > self.tolerance)
 
     def summary(self) -> str:
         if not self.ok:
             return f"  liquid check      : not run ({self.reason})"
         if not self.exceeds:
+            tail = (" - consistent, and for a fluid that never drops below "
+                    "its dew point\n                      an unchanging yield "
+                    "is the expected behaviour, not a failed fit"
+                    if self.above_dew_throughout else " - consistent")
             return (f"  liquid check      : produced CGR "
                     f"{self.cgr_median_recent:,.0f} vs initial "
-                    f"{self.initial_cgr:,.0f} STB/MMscf - consistent")
+                    f"{self.initial_cgr:,.0f} STB/MMscf"
+                    f" ({self.ratio_recent:.2f}x, within the "
+                    f"{100 * (self.tolerance - 1):.0f} % tolerance){tail}")
         return (f"  liquid check      : produced CGR "
                 f"{self.cgr_median_recent:,.0f} is {self.ratio_recent:.1f}x "
                 f"the initial {self.initial_cgr:,.0f} STB/MMscf, which a "
@@ -2789,7 +2863,8 @@ class LiquidCheck:
 def check_liquid_stream(cgr: np.ndarray, initial_cgr: Optional[float],
                         dates: Optional[pd.Series] = None,
                         recent_periods: int = 12,
-                        tolerance: float = 1.05) -> LiquidCheck:
+                        tolerance: float = 1.05,
+                        above_dew_throughout: bool = False) -> LiquidCheck:
     """Compare produced CGR against the ceiling the fluid itself sets."""
     if initial_cgr is None or not np.isfinite(initial_cgr) or initial_cgr <= 0:
         return LiquidCheck(ok=False, reason="no initial CGR supplied")
@@ -2819,7 +2894,8 @@ def check_liquid_stream(cgr: np.ndarray, initial_cgr: Optional[float],
         implied_non_condensate=float(max(0.0, 1.0 - 1.0 / ratio))
         if ratio > 0 else float("nan"),
         n_periods_over=int(np.sum(c > initial_cgr * tolerance)),
-        n_periods=int(c.size), by_year=by_year)
+        n_periods=int(c.size), by_year=by_year, tolerance=float(tolerance),
+        above_dew_throughout=bool(above_dew_throughout))
 
 
 @dataclass
@@ -2973,6 +3049,11 @@ class BankDiagnostic:
     n_points: int = 0
     p_value: float = float("nan")
     p_avg_source: str = "material balance"
+    # A condensate bank needs retrograde liquid, which needs the reservoir to
+    # be below its dew point. On a wet gas it never is, so a falling
+    # productivity index is ordinary depletion, damage or liquid loading -
+    # and calling it a bank sends the reader after the wrong cause.
+    above_dew_throughout: bool = False
 
     @property
     def indicative(self) -> bool:
@@ -2992,6 +3073,12 @@ class BankDiagnostic:
                 f"{self.trend_pct_per_year:+,.0f} %/yr "
                 f"(R2 {self.r2:.2f}, n={self.n_points})\n"
                 f"                      p_avg from {self.p_avg_source}")
+        if self.above_dew_throughout and self.loss_frac > 0:
+            head += ("\n                      NOT a condensate bank: the "
+                     "reservoir never fell below its dew point,\n"
+                     "                      so there is no retrograde liquid "
+                     "to drop out. Look to depletion,\n"
+                     "                      damage or liquid loading instead.")
         if self.indicative:
             head += (f"\n                      INDICATIVE only - {self.n_points} "
                      f"flowing pressures is below the {GOOD_BANK_POINTS} this "
@@ -3130,7 +3217,10 @@ def bank_diagnostic(t_days: np.ndarray, q_ws: np.ndarray, gp_mmscf: np.ndarray,
         trend_pct_per_year=float(100.0 * (math.exp(res.slope) - 1.0)),
         r2=float(res.rvalue ** 2), p_dew_crossed_days=crossed,
         n_points=int(len(pi_series)), p_value=float(res.pvalue),
-        p_avg_source=src)
+        p_avg_source=src,
+        above_dew_throughout=bool(
+            pvt.p_dew is not None and np.isfinite(pvt.p_dew)
+            and len(p_avg) and float(np.min(p_avg)) > float(pvt.p_dew)))
 
 
 @dataclass
@@ -3160,6 +3250,19 @@ class MaterialBalanceResult:
     pressure: np.ndarray
     gp: np.ndarray
     pz: np.ndarray
+    # -- rock and connate-water expansion (Ramagost-Farshad) ---------------
+    # The plain p/z line has no Efw term in it at all, so on an abnormally
+    # pressured reservoir it is not slightly optimistic - it is wrong by
+    # whatever share of the expansion the rock and the connate water
+    # provided, and the line stays straight while it happens. On marched
+    # tanks with a known G = 500 MMscf the plain line returned 585, 673 and
+    # 897 MMscf at cf = 12, 25 and 40 x 1e-6 /psi, at R2 0.992 to 0.999, and
+    # called every one of them volumetric.
+    ogip_efw_mmscf: float = float("nan")    # G from the corrected line
+    r2_efw: float = float("nan")
+    efw_shift_frac: float = float("nan")    # (plain - corrected) / corrected
+    efw_ce_per_psi: float = float("nan")    # (cw Sw + cf) / (1 - Sw)
+    efw_applied: bool = False               # corrected line is the headline
     ogip_single_phase: Optional[float] = None
     drive_note: str = ""
     # -- Havlena-Odeh -----------------------------------------------------
@@ -3239,6 +3342,33 @@ class MaterialBalanceResult:
                         "Fitting the line through it is circular - it tightens\n"
                         "                      the quoted error without adding "
                         "an independent measurement.")
+        # The correction is reported whenever it MATTERS, whether or not it
+        # was applied. Leaving it out silently is how a G comes back 79 % high
+        # with an R2 of 0.992 and a verdict of "volumetric".
+        if np.isfinite(self.efw_shift_frac):
+            if self.efw_applied:
+                lines.append(
+                    f"  rock/water expansion: APPLIED (Ramagost-Farshad, "
+                    f"ce = {1e6 * self.efw_ce_per_psi:.1f} x 1e-6 /psi).\n"
+                    f"                      Without it the same surveys give "
+                    f"{self.ogip_mmscf * (1 + self.efw_shift_frac):,.0f} "
+                    f"MMscf, {100 * self.efw_shift_frac:+.0f} %.")
+            elif abs(self.efw_shift_frac) >= 0.05:
+                lines.append(
+                    f"  ROCK/WATER EXPANSION: the OGIP above ignores it, and "
+                    f"here it is worth "
+                    f"{100 * self.efw_shift_frac:+.0f} %.\n"
+                    f"                      Correcting for it "
+                    f"(Ramagost-Farshad, ce = "
+                    f"{1e6 * self.efw_ce_per_psi:.1f} x 1e-6 /psi) gives "
+                    f"{self.ogip_efw_mmscf:,.0f} MMscf at R2 "
+                    f"{self.r2_efw:.4f}.\n"
+                    "                      A p/z line carries no Efw term, so "
+                    "on an abnormally pressured reservoir it\n"
+                    "                      stays straight and reads high. "
+                    "Check cf and Sw, and turn the correction on\n"
+                    "                      if this reservoir is "
+                    "overpressured.")
         if self.pz_note:
             lines.append(f"  NOTE              : {self.pz_note}")
         if np.isfinite(self.ho_rise):
@@ -3533,6 +3663,47 @@ def material_balance_pz(pressure: np.ndarray,
                             f"highest survey ({pi:,.0f} psia); supply a real "
                             "initial pressure to make F/Eg meaningful.")
 
+    # -- rock and connate-water expansion, Ramagost-Farshad ----------------
+    #
+    #     G (Eg + Efw) = Gp Bg     with Efw = Bgi ce dp
+    #
+    # rearranges exactly - no approximation - to
+    #
+    #     (p/z) (1 - ce dp) = (p/z)_i (1 - Gp/G),   ce = (cw Sw + cf)/(1 - Sw)
+    #
+    # so the corrected p/z is still a straight line and G is still minus the
+    # intercept over the slope. On tanks marched WITH the term present, the
+    # corrected line recovered a known G = 500 MMscf to 0.0 % at R2 1.000000
+    # in every case, where the plain line read 1.7 %, 17 %, 35 % and 79 % high.
+    #
+    # It is computed whether or not it was asked for, because the point is to
+    # find out whether it matters on THIS reservoir rather than to leave that
+    # to a default.
+    ce = (cw * sw + cf) / max(1.0 - sw, 1e-9)
+    ogip_efw = r2_efw = efw_shift = float("nan")
+    if pz_trend_ok and np.isfinite(pi) and len(g) >= 3:
+        try:
+            pz_c = pz * (1.0 - ce * (pi - p))
+            rc = stats.linregress(g, pz_c)
+            if rc.slope < 0:
+                ogip_efw = float(-rc.intercept / rc.slope)
+                r2_efw = float(rc.rvalue ** 2)
+                if ogip_efw > 0 and np.isfinite(ogip):
+                    efw_shift = float((ogip - ogip_efw) / ogip_efw)
+        except Exception:
+            pass
+
+    # Applying it swaps the headline OGIP for the corrected one. The
+    # uncorrected value is not discarded - the summary quotes it - because a
+    # reader who knows the reservoir is normally pressured needs to see what
+    # the correction did rather than take it on trust.
+    efw_applied = False
+    if include_efw and np.isfinite(ogip_efw) and ogip_efw > 0:
+        ogip_se *= abs(ogip_efw / max(abs(ogip), 1e-12)) if np.isfinite(ogip) \
+            and ogip != 0 else 1.0
+        ogip = ogip_efw
+        efw_applied = True
+
     ho = havlena_odeh_gas(p, g, pvt, pi, water_mstb=w, two_phase=two_phase,
                           method=method, include_efw=include_efw, sw=sw,
                           cf=cf, cw=cw, bw=bw, min_depletion=min_depletion)
@@ -3585,12 +3756,18 @@ def material_balance_pz(pressure: np.ndarray,
         p_initial_estimated=bool(p_initial_estimated),
         ogip_mmscf=float(ogip), ogip_stderr=float(ogip_se),
         r2=float(res.rvalue ** 2), pz_i=float(res.intercept),
-        method=("two-phase z" if two_phase else "single-phase z"),
+        method=("two-phase z" if two_phase else "single-phase z")
+        + (" (never below the dew point, so identical to single-phase)"
+           if two_phase and pvt.p_dew is not None and np.isfinite(pvt.p_dew)
+           and len(p) and float(np.min(p)) > float(pvt.p_dew) else ""),
         pressure=p, gp=g, pz=pz, ogip_single_phase=ogip_sp, drive_note=note,
         pz_trend_ok=pz_trend_ok, pz_note=pz_note,
         ho_table=ho, ho_rise=ho_rise, g_ceiling_mmscf=ceiling,
         g_bound_mmscf=g_bound, drive=drive, impossible=impossible,
         p_initial=pi, p_initial_known=bool(pi_known), gp_now=gp_now,
+        ogip_efw_mmscf=float(ogip_efw), r2_efw=float(r2_efw),
+        efw_shift_frac=float(efw_shift), efw_ce_per_psi=float(ce),
+        efw_applied=bool(efw_applied),
         n_surveys=len(p), n_skipped=n_skipped)
 
 
@@ -5760,6 +5937,15 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                  mb_p_initial: Optional[float] = None,
                  p_initial_estimated: bool = False,
                  mb_skip_early: int = 0,
+                 # Rock and connate-water expansion. These were not reachable
+                 # from here at all: material_balance_pz was called without
+                 # them, so cf, cw and Sw silently took module defaults and
+                 # the correction could not be switched on by anyone using
+                 # this function or the app on top of it.
+                 mb_include_efw: bool = False,
+                 mb_sw: float = 0.25,
+                 mb_cf_per_psi: float = 4.0e-6,
+                 mb_cw_per_psi: float = 3.0e-6,
                  use_aquifer: bool = True,
                  use_fmb: bool = False,
                  apply_ogip_cap: bool = True,
@@ -5888,6 +6074,18 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     # -- yield model ------------------------------------------------------
     gp_dew, gp_dew_note = gp_at_dewpoint(data.surveys, pvt.p_dew,
                                          float(data.Gp_ws[-1]))
+    # Did the reservoir ever go below its dew point? For a WET gas the answer
+    # is never - the reservoir temperature is above the cricondentherm, so
+    # nothing drops out downhole, the yield is constant and there is no bank.
+    # Several checks written for a retrograde condensate then fire on a
+    # perfectly clean stream, because the tool had no notion of fluid type.
+    _sv = data.surveys
+    _pr_all = (pd.to_numeric(_sv["p_res"], errors="coerce").to_numpy(float)
+               if _sv is not None and "p_res" in getattr(_sv, "columns", [])
+               else np.array([]))
+    _pr_all = _pr_all[np.isfinite(_pr_all) & (_pr_all > 0)]
+    above_dew = bool(pvt.p_dew is not None and np.isfinite(pvt.p_dew)
+                     and _pr_all.size > 0 and float(np.min(_pr_all)) > float(pvt.p_dew))
     try:
         yield_model = fit_yield_model(data.Gp_ws, data.cgr, Gp_dew=gp_dew,
                                       fit_dewpoint_break=(gp_dew is None))
@@ -5909,6 +6107,7 @@ def analyse_well(df: pd.DataFrame | ProductionData,
     # data were beyond question.
     if pvt.initial_cgr and np.isfinite(pvt.initial_cgr):
         yield_model.cgr_ceiling = float(pvt.initial_cgr)
+    yield_model.flat_is_expected = above_dew
 
     # -- material balance -------------------------------------------------
     matbal, matbal_note = None, ""
@@ -5941,7 +6140,9 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                     surv["Gp_ws"].to_numpy(float), pvt,
                     water_mstb=(surv[wcol].to_numpy(float) if wcol else None),
                     p_initial=mb_p_initial, skip_early=skip,
-                    p_initial_estimated=p_initial_estimated)
+                    p_initial_estimated=p_initial_estimated,
+                    include_efw=mb_include_efw, sw=mb_sw,
+                    cf=mb_cf_per_psi, cw=mb_cw_per_psi)
                 matbal_note = (f"{matbal.n_surveys} pressure surveys used"
                                + (f", {matbal.n_skipped} earliest dropped."
                                   if matbal.n_skipped else "."))
@@ -5997,7 +6198,8 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                 pd.to_numeric(data.df["q_water"],
                                               errors="coerce").to_numpy(float))
     liquid_check = check_liquid_stream(data.cgr, pvt.initial_cgr,
-                                       dates=data.df.get("date"))
+                                       dates=data.df.get("date"),
+                                       above_dew_throughout=above_dew)
     water_in_liquid = diagnose_water_in_liquid(
         data.cgr,
         (pd.to_numeric(data.df["q_water"], errors="coerce").to_numpy(float)
@@ -6101,6 +6303,11 @@ def analyse_well(df: pd.DataFrame | ProductionData,
                                "ogip_candidates": ogip_choice.candidates,
                                "aquifer_model": aquifer_model,
                                "matbal_note": matbal_note,
+                               "rock_water_expansion": (
+                                   f"Efw {'ON' if mb_include_efw else 'off'} "
+                                   f"(Sw {mb_sw:.2f}, cf "
+                                   f"{1e6 * mb_cf_per_psi:.1f}e-6, cw "
+                                   f"{1e6 * mb_cw_per_psi:.1f}e-6 /psi)"),
                                "terminal_decline_pct_yr": terminal_decline_pct_yr})
     if verbose:
         res.summary()
@@ -7218,6 +7425,38 @@ def run_self_tests(verbose: bool = True) -> bool:
           f"{rich.ratio_recent:.1f}x initial, implies "
           f"{100 * rich.implied_non_condensate:.0f} % of the liquid is not "
           "condensate")
+    # A WET gas: reservoir temperature above the cricondentherm, so nothing
+    # drops out downhole. The yield is constant, there is no bank, and the
+    # two-phase z reduces to the single-phase one. Several checks written for
+    # a retrograde condensate fired on a perfectly clean stream because the
+    # tool had no notion of fluid type.
+    cgr_wet = 25.0 * np.random.default_rng(8).lognormal(0.0, 0.06, 40)
+    lc_wet = check_liquid_stream(cgr_wet, 25.0, above_dew_throughout=True)
+    check("a constant wet-gas yield is not called contamination",
+          lc_wet.ok and not lc_wet.exceeds
+          and "expected behaviour" in lc_wet.summary(),
+          f"ratio {lc_wet.ratio_recent:.2f}x, inside the "
+          f"{100 * (lc_wet.tolerance - 1):.0f} % tolerance")
+    lc_bad = check_liquid_stream(cgr_wet * 3.0, 25.0, above_dew_throughout=True)
+    check("the ceiling still bites when the liquid really is wrong",
+          lc_bad.exceeds and lc_bad.ratio_recent > 2.5,
+          f"{lc_bad.ratio_recent:.1f}x is well outside the tolerance")
+    ym_wet = YieldModel(cgr_i=25.4, cgr_min=13.9, k=1e-9, Gp_dew=0.0)
+    ym_wet.r2, ym_wet.cgr_ceiling = -0.0003, 25.0
+    ym_wet.at_bounds = ["k"]
+    ym_wet.flat_is_expected = True
+    check("a flat yield above the dew point is a NOTE, not a warning",
+          len(ym_wet.warnings_) == 1
+          and "expected result" in ym_wet.warnings_[0]
+          and "NOTE" in ym_wet.summary() and "WARNING" not in ym_wet.summary(),
+          "no yield decline has started, which is not a failed fit")
+    bd_wet = BankDiagnostic(ok=True, pi_initial=1.0, pi_final=0.22,
+                            loss_frac=0.78, trend_pct_per_year=-62.0,
+                            r2=0.89, n_points=22, above_dew_throughout=True)
+    check("a PI fall above the dew point is not blamed on a bank",
+          "NOT a condensate bank" in bd_wet.summary(),
+          "no retrograde liquid means no bank, whatever the index does")
+
     check("the liquid check declines to run without an initial CGR",
           not check_liquid_stream(np.linspace(100.0, 500.0, 40), None).ok,
           "no ceiling means no test")
@@ -7582,6 +7821,45 @@ def run_self_tests(verbose: bool = True) -> bool:
         d_clean = ProductionData.prepare(df, pvt, well="C")
         df_dup = pd.concat([df, df.iloc[[len(df) // 2]]], ignore_index=True)
         d_dup = ProductionData.prepare(df_dup, pvt, well="D")
+        # The volume a well produced is a fact and cannot depend on whether
+        # the rate is expressed per stream-day or per calendar-day. It did:
+        # cumulatives were rebuilt as rate x days AFTER the rate had been
+        # rescaled, so 8L read 17,869 MMscf on one basis and 15,351 on the
+        # other - a 14 % swing in the number the material balance, the cap and
+        # the EUR all rest on, from a display choice.
+        d_sd = ProductionData.prepare(df, pvt, well="SD", rate_basis="stream-day")
+        d_cd = ProductionData.prepare(df, pvt, well="CD", rate_basis="calendar-day")
+        check("the cumulative does not depend on the rate basis",
+              abs(float(d_sd.Gp_ws[-1]) - float(d_cd.Gp_ws[-1])) < 1e-6
+              and abs(float(d_sd.Gp_sep[-1]) - float(d_cd.Gp_sep[-1])) < 1e-6,
+              f"{d_sd.Gp_ws[-1]:,.1f} vs {d_cd.Gp_ws[-1]:,.1f} MMscf wellstream")
+
+        # A period-volume column, read as a volume, must reproduce the same
+        # volumes and the same ratios as the equivalent rate column.
+        # Build the volume column from the volumes the module itself derived,
+        # not from raw days_on: `prepare` clips days-on to the period length
+        # (a 31-day month reported against a 28-day February), so multiplying
+        # by the unclipped column would test a different file.
+        fd = d_sd.full_df
+        df_vol = pd.DataFrame({
+            "date": fd["date"], "well": "V",
+            "days_on": fd["days_on"],
+            "q_gas": fd["vol_gas"], "q_cond": fd["vol_cond"],
+            "q_water": fd.get("vol_water", 0.0)})
+        d_vol = ProductionData.prepare(df_vol, pvt, well="V",
+                                       rate_basis="volume")
+        check("a volume column reproduces the rate column's answer",
+              abs(float(d_vol.Gp_ws[-1]) / float(d_sd.Gp_ws[-1]) - 1) < 1e-6
+              and abs(float(np.nanmedian(d_vol.cgr))
+                      / float(np.nanmedian(d_sd.cgr)) - 1) < 1e-6,
+              f"Gp {d_vol.Gp_ws[-1]:,.1f} vs {d_sd.Gp_ws[-1]:,.1f} MMscf, "
+              "CGR identical")
+        check("reading volumes as rates inflates the cumulative, as expected",
+              float(ProductionData.prepare(df_vol, pvt, well="B",
+                                           rate_basis="stream-day").Gp_ws[-1])
+              > float(d_vol.Gp_ws[-1]) * 5,
+              "the same file read the wrong way is out by the on-stream days")
+
         check("a repeated date is dropped, not counted twice",
               d_dup.qc.n_duplicate_dates == 1
               and abs(float(d_dup.Gp_ws[-1]) - float(d_clean.Gp_ws[-1])) < 1e-6
@@ -8064,6 +8342,71 @@ def run_self_tests(verbose: bool = True) -> bool:
               f"breached at start: {f_past.constraints_breached_at_start}")
     except Exception as exc:
         check("Monte Carlo honours the water limit", False, str(exc))
+
+    # -- rock and connate-water expansion (Ramagost-Farshad) ---------------
+    #
+    # A p/z line carries no Efw term, so on an abnormally pressured reservoir
+    # it stays perfectly straight and reads high - the expansion the rock and
+    # the connate water supplied is credited to gas that is not there. These
+    # tanks are marched WITH the term present, so the plain line has a known
+    # error and the corrected one has a known answer.
+    try:
+        def _march_gas_efw(G_mmscf, pvt_x, cf_x, cw_x, sw_x, p_final, n=14):
+            ps = np.linspace(pvt_x.p_init, p_final, n + 1)[1:]
+            zi = float(pvt_x.z_two_phase(np.array([pvt_x.p_init]))[0])
+            bgi = float(gas_fvf_rb_per_scf(np.array([pvt_x.p_init]),
+                                           pvt_x.T_R, np.array([zi]))[0])
+            ce_x = (cw_x * sw_x + cf_x) / (1.0 - sw_x)
+            gp_x = []
+            for pp in ps:
+                zz = float(pvt_x.z_two_phase(np.array([pp]))[0])
+                bg = float(gas_fvf_rb_per_scf(np.array([pp]), pvt_x.T_R,
+                                              np.array([zz]))[0])
+                gp_x.append(G_mmscf * 1e6 * ((bg - bgi)
+                            + bgi * ce_x * (pvt_x.p_init - pp)) / bg / 1e6)
+            return ps, np.array(gp_x)
+
+        G_T = 500.0
+        for tag, p_i_x, cf_x, expect_flag in (
+                ("normally pressured", 4100.0, 4.0e-6, False),
+                ("overpressured", 9000.0, 25.0e-6, True),
+                ("severely overpressured", 11000.0, 40.0e-6, True)):
+            pvt_x = PVT(gas_gravity=0.68, temperature_F=250.0,
+                        condensate_api=52.0, p_dew=1.0, p_init=p_i_x,
+                        initial_cgr=0.0)
+            ps_x, gp_x = _march_gas_efw(G_T, pvt_x, cf_x, 3.0e-6, 0.25,
+                                        0.55 * p_i_x)
+            off = material_balance_pz(ps_x, gp_x, pvt_x, p_initial=p_i_x,
+                                      sw=0.25, cf=cf_x, cw=3.0e-6)
+            on = material_balance_pz(ps_x, gp_x, pvt_x, p_initial=p_i_x,
+                                     sw=0.25, cf=cf_x, cw=3.0e-6,
+                                     include_efw=True)
+            err_corr = abs(on.ogip_mmscf - G_T) / G_T
+            check(f"Ramagost-Farshad recovers a known G, {tag}",
+                  err_corr < 0.01,
+                  f"{on.ogip_mmscf:,.1f} vs {G_T:,.1f} MMscf "
+                  f"({100 * err_corr:+.2f} %), plain line "
+                  f"{100 * (off.ogip_mmscf - G_T) / G_T:+.1f} %")
+            check(f"the correction is reported when it matters, {tag}",
+                  (abs(off.efw_shift_frac) >= 0.05) == expect_flag,
+                  f"shift {100 * off.efw_shift_frac:+.1f} %")
+            if expect_flag:
+                check(f"the report names the omitted term, {tag}",
+                      "ROCK/WATER EXPANSION" in off.summary())
+                check(f"the plain line still looks straight and volumetric, "
+                      f"{tag}",
+                      off.r2 > 0.99 and off.drive == "volumetric",
+                      f"R2 {off.r2:.4f}, drive {off.drive}")
+            check(f"applying the correction says what it changed, {tag}",
+                  "rock/water expansion: APPLIED" in on.summary())
+        # Reachable from the top-level workflow, which it was not before.
+        import inspect as _inspect
+        _sig = _inspect.signature(analyse_well).parameters
+        check("analyse_well exposes the rock/water expansion settings",
+              all(k in _sig for k in ("mb_include_efw", "mb_sw",
+                                      "mb_cf_per_psi", "mb_cw_per_psi")))
+    except Exception as exc:
+        check("Ramagost-Farshad correction", False, f"{type(exc).__name__}: {exc}")
 
     if verbose:
         width = 62
