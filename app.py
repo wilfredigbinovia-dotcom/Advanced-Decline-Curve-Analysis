@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import math
 import os
 import sys
@@ -601,7 +602,8 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
     (q_econ, model, terminal, t_max, run_mc, n_mc, use_mb, use_fmb, cap,
      rate_basis, min_uptime, outlier_sigma, fit_from_bdf, window,
      mb_pi, mb_skip, use_aq, ogip_mode, aquifer_model,
-     q_water_lim, wcut_lim, mb_efw, mb_sw, mb_cf, pi_estimated) = settings
+     q_water_lim, wcut_lim, mb_efw, mb_sw, mb_cf, pi_estimated,
+     field_name, reservoir_name, well_name) = settings
     # No surface processing is applied, so "sales gas" is the separator gas and
     # plant NGL is zero. Both are reported on the separator-gas basis below.
     split = dca.ProductSplit(inert_fraction=0.0, fuel_flare_fraction=0.0,
@@ -609,8 +611,11 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
                              ngl_shrinkage_fraction=0.0)
 
     raw = dca.map_columns(df)
+    # With no well column the whole file is one well, and it takes the name
+    # typed in the sidebar rather than the word FIELD.
     groups = ({str(k): v for k, v in raw.groupby(well_col)}
-              if well_col and well_col in raw.columns else {"FIELD": raw})
+              if well_col and well_col in raw.columns
+              else {(str(well_name).strip() or "WELL"): raw})
 
     prepared, prep_errors = {}, {}
     for name, grp in groups.items():
@@ -626,7 +631,9 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
     for name, pdata in prepared.items():
         try:
             results[name] = dca.analyse_well(
-                pdata, _pvt, well=name, q_econ_mscfd=q_econ, select=model,
+                pdata, _pvt, well=name, field=field_name,
+                reservoir=reservoir_name,
+                q_econ_mscfd=q_econ, select=model,
                 terminal_decline_pct_yr=terminal, t_max_years=t_max,
                 products=split, run_monte_carlo=run_mc, n_mc=n_mc,
                 use_material_balance=use_mb,
@@ -649,6 +656,8 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
     rows = []
     for name, r in results.items():
         row = {
+            "field": field_name,
+            "reservoir": reservoir_name,
             "well": name,
             "model": r.settings["selected_model"],
             "points_fitted": r.best_fit.n_points,
@@ -694,6 +703,17 @@ def run_analysis(df: pd.DataFrame, _pvt: dca.PVT, pvt_sig: tuple,
 # ==============================================================================
 
 with st.sidebar:
+    st.markdown("### Names")
+    note("These ride on the report header, the summary table and the export "
+         "file names, so a file read months later says what it was about.")
+    field_name = st.text_input("Field", "", key="field_name")
+    reservoir_name = st.text_input("Reservoir", "", key="reservoir_name")
+    well_name = st.text_input(
+        "Well", "", key="well_name",
+        help="Used when the data has no well column. With one, the names in "
+             "that column are used and this is ignored.")
+
+    st.markdown("---")
     st.markdown("### Fluid definition")
     note("Pseudo-pressure and the two-phase z-factor are built from these. "
          "Get the dew point and initial CGR right before anything else.")
@@ -956,6 +976,8 @@ pvt_sig = (gas_gravity, temperature_F, condensate_api, mw_override, p_dew,
 
 st.title("Gas condensate decline curve analysis")
 st.caption(f"v{dca.__version__}")
+if field_name or reservoir_name:
+    st.caption(" -- ".join(x for x in (field_name, reservoir_name) if x))
 note("Everything is fitted on a <b>wellstream (gas-equivalent)</b> basis, then "
      "re-split into products, so the gas and condensate forecasts can never "
      "drift apart. Below the dew point the material balance uses a "
@@ -1417,7 +1439,8 @@ settings = (q_econ, model_choice, terminal, float(t_max), run_mc, int(n_mc),
             # cached analysis is invalidated when it changes, and so the
             # material balance can say that its earliest survey is its own
             # extrapolation rather than an independent gauge reading.
-            bool(st.session_state.get("_pi_written") is not None))
+            bool(st.session_state.get("_pi_written") is not None),
+            field_name.strip(), reservoir_name.strip(), well_name.strip())
 with st.spinner("Fitting declines, yield models and material balance..."):
     try:
         results, summary, profile, errors = run_analysis(
@@ -2111,15 +2134,24 @@ with tabs[6]:
 with tabs[7]:
     st.markdown("**Downloads**")
     c1, c2, c3 = st.columns(3)
+    # File names carry the field and reservoir too, so a folder of exports
+    # from several reservoirs does not turn into six files called
+    # well_summary.csv.
+    def _stem(*parts) -> str:
+        out = "_".join(re.sub(r"[^A-Za-z0-9._-]+", "-", str(p)).strip("-")
+                       for p in parts if str(p).strip())
+        return out or "gas"
+    place = _stem(field_name, reservoir_name)
     c1.download_button("Well summary (CSV)",
                        summary.to_csv(index=False).encode(),
-                       "well_summary.csv", "text/csv")
+                       f"{place}_well_summary.csv", "text/csv")
     c2.download_button("Field profile (CSV)",
                        profile.to_csv(index=False).encode(),
-                       "field_profile.csv", "text/csv")
+                       f"{place}_field_profile.csv", "text/csv")
     c3.download_button(f"{sel} forecast (CSV)",
                        tidy_forecast(res.forecast.table).to_csv(index=False).encode(),
-                       f"{sel}_forecast.csv", "text/csv")
+                       f"{_stem(field_name, reservoir_name, sel)}_forecast.csv",
+                       "text/csv")
 
     buf = io.BytesIO()
     try:
@@ -2133,7 +2165,7 @@ with tabs[7]:
                 tidy_forecast(r.forecast.table).to_excel(
                     xl, sheet_name=f"{tag}_fcst"[:31], index=False)
         st.download_button("Full workbook (XLSX)", buf.getvalue(),
-                           "gas_condensate_dca.xlsx",
+                           f"{place}_gas_condensate_dca.xlsx",
                            "application/vnd.openxmlformats-officedocument."
                            "spreadsheetml.sheet")
     except Exception as exc:
@@ -2144,7 +2176,8 @@ with tabs[7]:
     with contextlib.redirect_stdout(sio):
         res.summary()
     st.download_button(f"{sel} report (TXT)", sio.getvalue().encode(),
-                       f"{sel}_report.txt", "text/plain")
+                       f"{_stem(field_name, reservoir_name, sel)}_report.txt",
+                       "text/plain")
     st.code(sio.getvalue(), language="text")
 
 

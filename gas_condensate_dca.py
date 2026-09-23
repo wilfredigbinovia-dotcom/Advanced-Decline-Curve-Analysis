@@ -143,7 +143,7 @@ from scipy.interpolate import interp1d
 #       p/z in silence: it extrapolates instead of clamping, and the mismatch
 #       is reported. A Fetkovich fit that did not converge is refused rather
 #       than printed. The headline gas in place follows the cap selector.
-__version__ = "40.0"
+__version__ = "41.0"
 
 __all__ = [
     "__version__", "PVT", "CVDTable",
@@ -5612,7 +5612,29 @@ class WellResult:
     liquid_check: Optional[LiquidCheck] = None
     water_in_liquid: Optional[WaterInLiquid] = None
     bank: Optional[BankDiagnostic] = None
+    # Where the analysis belongs. Carried so a report read months later says
+    # which reservoir it was about; neither touches a calculation.
+    field_name: str = ""
+    reservoir_name: str = ""
     settings: Dict = field(default_factory=dict)
+
+    @property
+    def where_line(self) -> str:
+        """field / reservoir, for the report header and the chart titles."""
+        bits = []
+        if str(self.field_name).strip():
+            bits.append(f"field: {str(self.field_name).strip()}")
+        if str(self.reservoir_name).strip():
+            bits.append(f"reservoir: {str(self.reservoir_name).strip()}")
+        return "   ".join(bits)
+
+    @property
+    def label(self) -> str:
+        """Well, with the field and reservoir in brackets where they exist."""
+        bits = [str(b).strip() for b in (self.field_name,
+                                         self.reservoir_name)
+                if str(b).strip()]
+        return f"{self.well} ({', '.join(bits)})" if bits else str(self.well)
 
     def _window_block(self) -> str:
         """How much the trend depends on where the window starts."""
@@ -5667,8 +5689,10 @@ class WellResult:
 
     def summary(self, stream=None) -> str:
         out = [f"{'=' * 78}",
-               f" WELL {self.well}",
-               f"{'=' * 78}",
+               f" WELL {self.well}"]
+        if self.where_line:
+            out.append(f" {self.where_line}")
+        out += [f"{'=' * 78}",
                "",
                "-- Data QC " + "-" * 66,
                self.data.qc.summary(),
@@ -5920,6 +5944,8 @@ class WellResult:
 def analyse_well(df: pd.DataFrame | ProductionData,
                  pvt: PVT,
                  well: str = "WELL",
+                 field: str = "",
+                 reservoir: str = "",
                  q_econ_mscfd: float = 250.0,
                  models: Sequence[str] = ("arps", "modified_hyperbolic", "ple", "sepd"),
                  select: str = "modified_hyperbolic",
@@ -6287,7 +6313,9 @@ def analyse_well(df: pd.DataFrame | ProductionData,
             mc_note = str(exc)
             warnings.warn(f"[{well}] Monte Carlo failed: {exc}")
 
-    res = WellResult(well=well, data=data, pvt=pvt, model_table=table, fits=fits,
+    res = WellResult(well=well, field_name=str(field or ""),
+                     reservoir_name=str(reservoir or ""),
+                     data=data, pvt=pvt, model_table=table, fits=fits,
                      best_fit=best, yield_model=yield_model, forecast=fc,
                      mc=mc, mc_stats=mc_stats, mc_note=mc_note,
                      matbal=matbal, fmb=fmb,
@@ -8165,6 +8193,25 @@ def run_self_tests(verbose: bool = True) -> bool:
               or (bool(r_nomc.mc_note)
                   and "not available" in r_nomc.summary()),
               (r_nomc.mc_note or "it ran")[:70])
+
+        # Field and reservoir names ride on the header and nothing else.
+        r_named = analyse_well(df, pvt, well="A-12", field="Marimba",
+                               reservoir="D-4 sand", verbose=False,
+                               run_monte_carlo=False)
+        head_n = r_named.summary().splitlines()[1:3]
+        check("the report header carries the field and the reservoir",
+              "A-12" in head_n[0] and "field: Marimba" in head_n[1]
+              and "reservoir: D-4 sand" in head_n[1], " | ".join(head_n))
+        check("the well label names the well, field and reservoir",
+              r_named.label == "A-12 (Marimba, D-4 sand)", r_named.label)
+        r_plain = analyse_well(df, pvt, well="A-12", verbose=False,
+                               run_monte_carlo=False)
+        check("an unnamed analysis keeps the plain header",
+              r_plain.summary().splitlines()[1].strip() == "WELL A-12"
+              and r_plain.label == "A-12" and r_plain.where_line == "")
+        check("the names change nothing the analysis computes",
+              abs(r_named.forecast.eur_wellstream_mmscf
+                  - r_plain.forecast.eur_wellstream_mmscf) < 1e-9)
 
         # (f) `skip_early` was clamped by the material balance but NOT by the
         # aquifer fit beside it, so an over-large value gave the two different
